@@ -139,17 +139,6 @@ local function getPart(inst)
     return nil
 end
 
-local function isCandidate(inst)
-    if not (inst:IsA("BasePart") or inst:IsA("Model")) then return false end
-    if not matchesKeyword(inst.Name) then return false end
-    if inst == LP.Character then return false end
-    local char = LP.Character
-    if char and inst:IsDescendantOf(char) then return false end
-    if inst:IsA("Model") and inst:FindFirstChildOfClass("Humanoid") then return false end
-    if not inEggContainer(inst) and not attrRarity(inst) then return false end
-    return true
-end
-
 local function distTo(part)
     local char = LP.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -168,7 +157,7 @@ local function destroyESP(inst)
     state.espCache[inst] = nil
 end
 
-local function buildESP(inst, part, rarity)
+local function buildESP(inst, part, rarity, displayName)
     local col = RARITY[rarity] or RARITY.common
 
     local hl = Instance.new("Highlight")
@@ -197,55 +186,87 @@ local function buildESP(inst, part, rarity)
     label.TextColor3 = col
     label.TextStrokeTransparency = 0.3
     label.TextStrokeColor3 = Color3.new(0, 0, 0)
-    label.Text = inst.Name
+    label.Text = displayName or inst.Name
     label.Parent = bb
 
     state.espCache[inst] = { billboard = bb, highlight = hl, label = label }
-end
-
-local function updateLabel(inst, part)
-    local c = state.espCache[inst]
-    if not c or not c.label then return end
-    local d = distTo(part)
-    if d == math.huge then d = 0 end
-    c.label.Text = string.format("%s  [%d]", inst.Name, math.floor(d))
 end
 
 --─────────────────────────────────────────────────────────────────────────────
 -- SCAN LOOP
 --────────────────────────────────────────────────────────────────────────────
 local function collectEggs()
-    local found = {}
+    -- 3 lapis: strict (folder/attribute) → name (nama mengandung egg) → label (BillboardGui ber-teks egg)
+    local strict, nameOnly, labelOnly = {}, {}, {}
+
     local ok = pcall(function()
-        local roots = { Workspace }
-        for _, name in ipairs({ "Eggs", "Egg", "EggFolder", "EggsFolder" }) do
-            local direct = Workspace:FindFirstChild(name)
-            if direct then roots = { direct } ; break end
-        end
-        for _, root in ipairs(roots) do
-            for _, inst in ipairs(root:GetDescendants()) do
-                local good, pass = pcall(isCandidate, inst)
-                if good and pass then
-                    local part = getPart(inst)
-                    if part then found[inst] = { part = part, rarity = rarityOf(inst) } end
-                end
+        local claimed = {}
+        local function isClaimed(inst)
+            local node = inst
+            for _ = 1, 5 do
+                if claimed[node] then return true end
+                node = node.Parent
+                if not node or node == Workspace then break end
             end
-            if next(found) then break end
-            -- loose retry: whole workspace
-            if root == Workspace then
-                local loose = {}
-                for _, inst in ipairs(Workspace:GetDescendants()) do
-                    if (inst:IsA("BasePart") or inst:IsA("Model")) and matchesKeyword(inst.Name) then
-                        local part = getPart(inst)
-                        if part then loose[inst] = { part = part, rarity = rarityOf(inst) } end
+            return false
+        end
+
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            local isPart  = inst:IsA("BasePart")
+            local isModel = inst:IsA("Model")
+            if (isPart or isModel)
+            and inst ~= LP.Character
+            and not (LP.Character and inst:IsDescendantOf(LP.Character)) then
+                local humanoid = isModel and inst:FindFirstChildOfClass("Humanoid")
+                if not humanoid and not isClaimed(inst) and matchesKeyword(inst.Name) then
+                    local part = getPart(inst)
+                    if part then
+                        local entry = { part = part, rarity = rarityOf(inst) }
+                        if inEggContainer(inst) or attrRarity(inst) then
+                            strict[inst] = entry
+                        else
+                            nameOnly[inst] = entry
+                        end
+                        claimed[inst] = true
                     end
                 end
-                found = loose
+            end
+        end
+
+        -- pass 3: label di atas telur (nama model generik)
+        if not next(strict) and not next(nameOnly) then
+            for _, inst in ipairs(Workspace:GetDescendants()) do
+                if inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
+                    local txt
+                    for _, ch in ipairs(inst:GetDescendants()) do
+                        if ch:IsA("TextLabel") and matchesKeyword(ch.Text) then
+                            txt = ch.Text
+                            break
+                        end
+                    end
+                    if txt then
+                        local target
+                        if inst.Adornee and inst.Adornee:IsA("BasePart") then
+                            target = inst.Adornee
+                        elseif inst.Parent and inst.Parent:IsA("BasePart") then
+                            target = inst.Parent
+                        end
+                        if target and not claimed[target] then
+                            labelOnly[target] = { part = target, rarity = rarityOf(target), label = txt }
+                            claimed[target] = true
+                        end
+                    end
+                end
             end
         end
     end)
+
     if not ok then return state.eggs end
-    return found
+    if next(strict)    then state.scanMode = "strict"; return strict    end
+    if next(nameOnly)  then state.scanMode = "name";   return nameOnly  end
+    if next(labelOnly) then state.scanMode = "label";  return labelOnly end
+    state.scanMode = "none"
+    return {}
 end
 
 local function refreshESP()
@@ -274,7 +295,7 @@ local function refreshESP()
     for i = 1, math.min(#list, CONFIG.maxRendered) do
         local e = list[i]
         if not state.espCache[e.inst] then
-            local ok = pcall(buildESP, e.inst, e.data.part, e.data.rarity)
+            local ok = pcall(buildESP, e.inst, e.data.part, e.data.rarity, e.data.name)
             if not ok then state.espCache[e.inst] = nil end
         end
     end
@@ -677,7 +698,7 @@ local function renderEggList()
         if inst.Parent and data.part and data.part.Parent then
             local d = distTo(data.part)
             if d <= CONFIG.maxDistance then
-                table.insert(list, { inst = inst, part = data.part, rarity = data.rarity, d = d })
+                table.insert(list, { inst = inst, part = data.part, rarity = data.rarity, name = data.name, d = d })
             end
         end
     end
@@ -712,7 +733,7 @@ local function renderEggList()
         lbl.TextColor3 = C_TEXT
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.TextTruncate = Enum.TextTruncate.AtEnd
-        lbl.Text = e.inst.Name
+        lbl.Text = e.name or e.inst.Name
         lbl.Parent = row
 
         local dlbl = Instance.new("TextLabel")
@@ -895,7 +916,7 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v1"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v2"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -909,8 +930,8 @@ local function statusLoop()
         local cap = Players.MaxPlayers
         srvInfo.Text = string.format("server saat ini: %d/%d pemain", here, cap)
         statusLabel.Text = string.format(
-            "egg terdeteksi: %d · tampil: %d · auto-tp: %s",
-            found, state.rendered, state.autoTPOn and "ON" or "OFF"
+            "egg: %d · mode:%s · tampil:%d · auto-tp:%s",
+            found, state.scanMode or "-", state.rendered, state.autoTPOn and "ON" or "OFF"
         )
         task.wait(0.5)
     end
@@ -982,4 +1003,24 @@ task.spawn(function()
     task.wait(0.5)
     pcall(fetchServers)
     if state.alive then renderServers() end
+end)
+-- auto-diagnosa: kalau 6 detik masih 0 egg, buang sampel struktur ke console
+task.spawn(function()
+    task.wait(6)
+    if not state.alive then return end
+    local n = 0
+    for _ in pairs(state.eggs) do n = n + 1 end
+    if n == 0 then
+        local out = {}
+        pcall(function()
+            for _, inst in ipairs(Workspace:GetDescendants()) do
+                if (inst:IsA("BasePart") or inst:IsA("Model")) and #out < 60 then
+                    table.insert(out, inst.ClassName .. " :: " .. inst:GetFullName())
+                end
+            end
+        end)
+        print("[SAE] 0 egg terdeteksi — mode:" .. tostring(state.scanMode) ..
+            " | sampel objek:\n" .. table.concat(out, "\n"))
+        notify("0 egg — buka console (F9), kirim isi ke Asta", 7)
+    end
 end)

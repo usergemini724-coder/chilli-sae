@@ -5,7 +5,7 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=1"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=2"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
@@ -35,11 +35,13 @@ Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 me
 
 ## Kalau egg tidak terdeteksi
 
-Egg dideteksi dari **nama objek** yang mengandung `egg` di dalam folder ber-egg, atau objek yang punya attribute `Rarity`/`Type`/`Tier`. Kalau game update dan nama berubah:
+Deteksi 3 lapis (v2):
 
-1. Jalankan `_G.SAE_EGGF.dump()` di console → daftar kandidat ter-copy ke clipboard
-2. Sesuaikan `CONFIG.keywords` di bagian atas file
-3. Push sebagai `v+1`
+1. **strict** — nama mengandung `egg` DAN berada di folder ber-egg atau punya attribute `Rarity`/`Type`/`Tier`
+2. **name** — nama mengandung `egg`, di mana pun
+3. **label** — BillboardGui/TextLabel yang teksnya mengandung `egg` (model bernama generik)
+
+Mode aktif tampil di status bar (`mode:strict` dst). Kalau semua gagal, setelah 6 detik script otomatis buang sampel 60 objek ke console (F9) — kirim ke Asta untuk tuning `CONFIG.keywords`.
 
 ## Struktur
 
