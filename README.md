@@ -5,14 +5,23 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=2"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=3"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
 
 ## Fitur
 
-**Tab EGG FINDER**
+**Tab FINDER** (ala Chilli Finder, keyless)
+- Feed "top recent eggs": nama, badge rarity (golden/rainbow/...), `$value/s`, `xmultiplier`, umur (`3m ago`), tombol `JOIN` per baris
+- Feed lokal yang **persist di disk executor** (`chilli_sae_feed.json`) — riwayat lolos teleport karena tiap hop hanya matikan VM, file tetap ada
+- `AUTO` — server-hopping otomatis (klik: 5s → 10s → 15s → 30s → OFF); berhenti hop kalau egg lolos filter ada di server sekarang
+- `MIN` — filter nilai minimum (Any/1M/100M/1B/10B/100B/1T per detik)
+- `RARITY` — filter mutasi (Any/Golden/Rainbow/Mythic/Secret/Divine)
+- `CLEAR` — bersihkan feed
+- Value & multiplier di-parse dari BillboardGui game; egg dicatat kalau `≥$1M/s` atau bukan common
+
+**Tab ESP**
 - ESP: nama egg + jarak meter + highlight per rarity
 - Auto-teleport ke egg terdekat (toggle + cooldown 1,5 s)
 - Range maksimum bisa diatur (default 2500 m)
@@ -48,9 +57,12 @@ Mode aktif tampil di status bar (`mode:strict` dst). Kalau semua gagal, setelah 
 | Bagian | Isi |
 |---|---|
 | `CONFIG` | interval scan, range, keyword, cooldown |
-| `RARITY` | peta warna rarity |
+| `FILTER` / `feed` | filter finder + feed lokal (`chilli_sae_feed.json`) |
+| `extractInfo` | parse nama, `$X/s`, `xN`, mutasi dari label game |
+| `RARITY` / `MUT_COLORS` | peta warna rarity & mutasi |
 | `collectEggs` / `refreshESP` | deteksi + render, cap `maxRendered` |
 | `fetchServers` | `games.roblox.com/v1/games/{placeId}/servers/Public` |
+| `pickHopTarget` / `autoLoop` | pemilihan server & hopping otomatis |
 | `joinServer` | teleport ke `jobId` |
 
 ## Catatan

@@ -147,6 +147,146 @@ local function distTo(part)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
+-- FINDER FEED — keyless local feed, persist via executor storage
+--─────────────────────────────────────────────────────────────────────────────
+local FILTER = { minValue = 0, rarity = "any", auto = false, interval = 5 }
+local joinServer, fetchServers, pickHopTarget  -- forward declarations
+
+local VALUE_STEPS  = { 0, 1e6, 1e8, 1e9, 1e10, 1e11, 1e12 }
+local RARITY_STEPS = { "any", "golden", "rainbow", "mythic", "secret", "divine" }
+
+local MUT_COLORS = {
+    golden  = Color3.fromRGB(255, 200, 60),
+    rainbow = Color3.fromRGB(255, 120, 220),
+    mythic  = Color3.fromRGB(255, 80, 120),
+    secret  = Color3.fromRGB(255, 240, 120),
+    divine  = Color3.fromRGB(140, 255, 240),
+    godly   = Color3.fromRGB(255, 120, 255),
+}
+
+local FEED_FILE = "chilli_sae_feed.json"
+local feed = { entries = {}, visited = {} }
+
+local function fmtValue(n)
+    if not n or n <= 0 then return "-" end
+    local units = { { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
+    for _, u in ipairs(units) do
+        if n >= u[1] then
+            local v = n / u[1]
+            local s = v >= 100 and string.format("%.0f", v) or string.format("%.2f", v)
+            return "$" .. s .. u[2] .. "/s"
+        end
+    end
+    return string.format("$%d/s", math.floor(n))
+end
+
+local function fmtAge(ts)
+    local d = os.time() - (ts or os.time())
+    if d < 0 then d = 0 end
+    if d < 60 then return d .. "s ago" end
+    if d < 3600 then return math.floor(d / 60) .. "m ago" end
+    return math.floor(d / 3600) .. "h ago"
+end
+
+local function loadFeed()
+    local ok, txt = pcall(readfile, FEED_FILE)
+    if ok and type(txt) == "string" and #txt > 2 then
+        local okd, dec = pcall(HttpService.JSONDecode, HttpService, txt)
+        if okd and type(dec) == "table" then
+            feed.entries = dec.entries or {}
+            feed.visited = dec.visited or {}
+        end
+    end
+end
+
+local function saveFeed()
+    pcall(function()
+        writefile(FEED_FILE, HttpService:JSONEncode(feed))
+    end)
+end
+
+local function addFeedEntry(e)
+    local key = (e.jobId or "") .. "|" .. (e.name or "") .. "|" ..
+        tostring(e.value) .. "|" .. tostring(math.floor((e.ts or 0) / 30))
+    for _, ex in ipairs(feed.entries) do
+        if ex.key == key then return false end
+    end
+    e.key = key
+    table.insert(feed.entries, 1, e)
+    if #feed.entries > 200 then table.remove(feed.entries) end
+    return true
+end
+
+local function matchesFilters(e)
+    if FILTER.minValue > 0 and (e.value or 0) < FILTER.minValue then return false end
+    if FILTER.rarity ~= "any" and lower(e.rarity or "") ~= FILTER.rarity then return false end
+    return true
+end
+
+local function parseMoney(text)
+    local num, suf = string.match(text, "%$([%d%.]+)%s*(%a?)%s*/s")
+    if num then
+        local n = tonumber(num) or 0
+        local suffixMult = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
+        n = n * (suffixMult[suf] or 1)
+        if n > 0 then return n end
+    end
+    return nil
+end
+
+local function parseMult(text)
+    local m = string.match(text, "x%s*([%d%.]+)")
+    if m then return tonumber(m) end
+    return nil
+end
+
+-- baca label di sekitar objek: nama, $/s, x-multiplier, mutasi (golden/rainbow/...)
+local function extractInfo(inst, part, fallbackLabel)
+    local texts = {}
+    if fallbackLabel then table.insert(texts, fallbackLabel) end
+    pcall(function()
+        local node = part
+        for _ = 1, 3 do
+            if not node then break end
+            for _, ch in ipairs(node:GetDescendants()) do
+                if (ch:IsA("TextLabel") or ch:IsA("TextButton")) and ch.Text and #ch.Text > 0 and #ch.Text < 64 then
+                    table.insert(texts, ch.Text)
+                end
+            end
+            if #texts > 10 then break end
+            node = node.Parent
+        end
+    end)
+
+    local value, mult, mutation
+    local nameTxt, nameScore = nil, -1
+    for _, t in ipairs(texts) do
+        local v = parseMoney(t)
+        if v and not value then value = v end
+        local m = parseMult(t)
+        if m and not mult then mult = m end
+        local low = lower(t)
+        for mut in pairs(MUT_COLORS) do
+            if string.find(low, mut, 1, true) and not mutation then mutation = mut end
+        end
+        if not string.find(t, "%$") and not string.find(t, "x%s*[%d%.]") then
+            local letters = 0
+            for i = 1, #t do
+                local c = string.sub(t, i, i)
+                if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == " " then
+                    letters = letters + 1
+                end
+            end
+            if letters > nameScore and letters >= 3 then
+                nameScore = letters
+                nameTxt = t
+            end
+        end
+    end
+    return nameTxt, value, mult, mutation
+end
+
+--─────────────────────────────────────────────────────────────────────────────
 -- ESP
 --─────────────────────────────────────────────────────────────────────────────
 local function destroyESP(inst)
@@ -252,7 +392,7 @@ local function collectEggs()
                             target = inst.Parent
                         end
                         if target and not claimed[target] then
-                            labelOnly[target] = { part = target, rarity = rarityOf(target), label = txt }
+                            labelOnly[target] = { part = target, rarity = rarityOf(target), label = txt, name = txt }
                             claimed[target] = true
                         end
                     end
@@ -359,7 +499,7 @@ local function httpGet(url)
     return nil
 end
 
-local function fetchServers()
+function fetchServers()
     if state.fetching then return end
     state.fetching = true
     local out, cursor, pages = {}, nil, 0
@@ -398,9 +538,9 @@ local function fetchServers()
     return out
 end
 
-local function joinServer(jobId)
+function joinServer(jobId)
     if not jobId or jobId == "" then return end
-    if jobId == state.currentJob then notify("Sudah di server ini", 2) return end
+    if jobId == game.JobId then notify("Sudah di server itu", 2) return end
     notify("Menghubungkan ke " .. string.sub(jobId, 1, 8) .. "...", 3)
     local ok, err = pcall(function()
         TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LP)
@@ -412,6 +552,20 @@ local function joinServer(jobId)
         end)
         notify("Fallback TeleportAsync: " .. tostring(err), 4)
     end
+end
+
+function pickHopTarget()
+    if #state.servers == 0 then pcall(fetchServers) end
+    local now = os.time()
+    local fallback
+    for _, s in ipairs(state.servers) do
+        if s.id ~= game.JobId and s.playing > 0 and s.playing < s.max then
+            local last = feed.visited[s.id]
+            if not last or now - last > 480 then return s.id end
+            if not fallback then fallback = s.id end
+        end
+    end
+    return fallback
 end
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -519,10 +673,11 @@ tabBar.Position = UDim2.fromOffset(12, 42)
 tabBar.BackgroundTransparency = 1
 tabBar.Parent = main
 
-local function makeTab(text, order)
+local function makeTab(text, order, count)
+    count = count or 2
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0.5, -4, 1, 0)
-    b.Position = UDim2.new(order * 0.5, order * 4, 0, 0)
+    b.Size = UDim2.new(1 / count, -4, 1, 0)
+    b.Position = UDim2.new(order / count, order * 4, 0, 0)
     b.BackgroundColor3 = C_PANEL
     b.Font = Enum.Font.GothamBold
     b.TextSize = 12
@@ -535,14 +690,20 @@ local function makeTab(text, order)
     return b
 end
 
-local tabEgg    = makeTab("EGG FINDER", 0)
-local tabServer = makeTab("SERVERS", 1)
+local tabFind   = makeTab("FINDER", 0, 3)
+local tabEgg    = makeTab("ESP", 1, 3)
+local tabServer = makeTab("SERVERS", 2, 3)
 
 local pages = Instance.new("Frame")
 pages.Size = UDim2.new(1, -24, 1, -110)
 pages.Position = UDim2.fromOffset(12, 78)
 pages.BackgroundTransparency = 1
 pages.Parent = main
+
+local finderPage = Instance.new("Frame")
+finderPage.Size = UDim2.fromScale(1, 1)
+finderPage.BackgroundTransparency = 1
+finderPage.Parent = pages
 
 local eggPage = Instance.new("Frame")
 eggPage.Size = UDim2.fromScale(1, 1)
@@ -556,16 +717,216 @@ srvPage.Visible = false
 srvPage.Parent = pages
 
 local function setTab(which)
-    local eggOn = which == "egg"
-    eggPage.Visible = eggOn
-    srvPage.Visible = not eggOn
-    tabEgg.BackgroundColor3 = eggOn and C_PANEL or C_BG
-    tabEgg.TextColor3 = eggOn and C_ACCENT or C_DIM
-    tabServer.BackgroundColor3 = (not eggOn) and C_PANEL or C_BG
-    tabServer.TextColor3 = (not eggOn) and C_ACCENT or C_DIM
+    finderPage.Visible = which == "finder"
+    eggPage.Visible = which == "egg"
+    srvPage.Visible = which == "srv"
+    tabFind.BackgroundColor3 = which == "finder" and C_PANEL or C_BG
+    tabFind.TextColor3 = which == "finder" and C_ACCENT or C_DIM
+    tabEgg.BackgroundColor3 = which == "egg" and C_PANEL or C_BG
+    tabEgg.TextColor3 = which == "egg" and C_ACCENT or C_DIM
+    tabServer.BackgroundColor3 = which == "srv" and C_PANEL or C_BG
+    tabServer.TextColor3 = which == "srv" and C_ACCENT or C_DIM
 end
+tabFind.MouseButton1Click:Connect(function() setTab("finder") end)
 tabEgg.MouseButton1Click:Connect(function() setTab("egg") end)
 tabServer.MouseButton1Click:Connect(function() setTab("srv") end)
+
+--─────────────────────────────────────────────────────────────────────────────
+-- FINDER PAGE — "top recent eggs" keyless
+--─────────────────────────────────────────────────────────────────────────────
+local btnRow = Instance.new("Frame")
+btnRow.Size = UDim2.new(1, 0, 0, 30)
+btnRow.BackgroundTransparency = 1
+btnRow.Parent = finderPage
+
+local function makeFilterBtn(text, order)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.25, -3, 1, 0)
+    b.Position = UDim2.new(order * 0.25, order * 4, 0, 0)
+    b.BackgroundColor3 = C_PANEL
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.TextColor3 = C_TEXT
+    b.Text = text
+    b.Parent = btnRow
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 5)
+    c.Parent = b
+    return b
+end
+
+local btnAuto   = makeFilterBtn("AUTO OFF", 0)
+local btnMinVal = makeFilterBtn("MIN Any", 1)
+local btnRarity = makeFilterBtn("RARITY Any", 2)
+local btnClear  = makeFilterBtn("CLEAR", 3)
+
+local finderSub = Instance.new("TextLabel")
+finderSub.Size = UDim2.new(1, 0, 0, 18)
+finderSub.Position = UDim2.fromOffset(0, 32)
+finderSub.BackgroundTransparency = 1
+finderSub.Font = Enum.Font.GothamBold
+finderSub.TextSize = 10
+finderSub.TextColor3 = C_DIM
+finderSub.TextXAlignment = Enum.TextXAlignment.Left
+finderSub.Text = "0 egg tercatat · keyless local feed"
+finderSub.Parent = finderPage
+
+local finderList = Instance.new("ScrollingFrame")
+finderList.Size = UDim2.new(1, 0, 1, -54)
+finderList.Position = UDim2.fromOffset(0, 54)
+finderList.BackgroundTransparency = 1
+finderList.BorderSizePixel = 0
+finderList.ScrollBarThickness = 4
+finderList.CanvasSize = UDim2.new()
+finderList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+finderList.Parent = finderPage
+
+local finderLayout = Instance.new("UIListLayout")
+finderLayout.Padding = UDim.new(0, 3)
+finderLayout.SortOrder = Enum.SortOrder.LayoutOrder
+finderLayout.Parent = finderList
+
+local function rarityColor(rar)
+    return MUT_COLORS[lower(rar or "")] or RARITY[lower(rar or "")] or RARITY.common
+end
+
+local function renderFinder()
+    for _, ch in ipairs(finderList:GetChildren()) do
+        if ch:IsA("Frame") then ch:Destroy() end
+    end
+
+    local shown = {}
+    for _, e in ipairs(feed.entries) do
+        if matchesFilters(e) then
+            table.insert(shown, e)
+            if #shown >= 15 then break end
+        end
+    end
+
+    finderSub.Text = string.format("%d egg tercatat · feed lokal (keyless)", #feed.entries)
+
+    if #shown == 0 then
+        local empty = Instance.new("TextLabel")
+        empty.Size = UDim2.new(1, 0, 0, 30)
+        empty.BackgroundTransparency = 1
+        empty.Font = Enum.Font.Gotham
+        empty.TextSize = 11
+        empty.TextColor3 = C_DIM
+        empty.Text = "kosong — nyalakan AUTO untuk server-hopping"
+        empty.Parent = finderList
+        return
+    end
+
+    for i, e in ipairs(shown) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 42)
+        row.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+        row.LayoutOrder = i
+        row.Parent = finderList
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 5)
+        c.Parent = row
+
+        local name = Instance.new("TextLabel")
+        name.Size = UDim2.new(1, -90, 0, 18)
+        name.Position = UDim2.fromOffset(10, 2)
+        name.BackgroundTransparency = 1
+        name.Font = Enum.Font.GothamBold
+        name.TextSize = 12
+        name.TextColor3 = C_TEXT
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.TextTruncate = Enum.TextTruncate.AtEnd
+        name.Text = e.name or "?"
+        name.Parent = row
+
+        local badge = Instance.new("TextLabel")
+        badge.Size = UDim2.fromOffset(74, 16)
+        badge.Position = UDim2.fromOffset(10, 22)
+        badge.BackgroundTransparency = 1
+        badge.Font = Enum.Font.GothamBold
+        badge.TextSize = 10
+        badge.TextColor3 = rarityColor(e.rarity)
+        badge.TextXAlignment = Enum.TextXAlignment.Left
+        badge.Text = e.rarity or "common"
+        badge.Parent = row
+
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.new(1, -200, 0, 16)
+        val.Position = UDim2.fromOffset(84, 22)
+        val.BackgroundTransparency = 1
+        val.Font = Enum.Font.GothamBold
+        val.TextSize = 10
+        val.TextColor3 = Color3.fromRGB(120, 230, 140)
+        val.TextXAlignment = Enum.TextXAlignment.Left
+        val.Text = (e.value and e.value > 0 and fmtValue(e.value) or "-") ..
+            ((e.mult and e.mult > 0) and ("  x" .. string.format("%.2f", e.mult)) or "")
+        val.Parent = row
+
+        local age = Instance.new("TextLabel")
+        age.Size = UDim2.fromOffset(52, 16)
+        age.Position = UDim2.new(1, -140, 0, 22)
+        age.BackgroundTransparency = 1
+        age.Font = Enum.Font.Gotham
+        age.TextSize = 10
+        age.TextColor3 = C_DIM
+        age.TextXAlignment = Enum.TextXAlignment.Right
+        age.Text = fmtAge(e.ts)
+        age.Parent = row
+
+        local jb = Instance.new("TextButton")
+        jb.Size = UDim2.fromOffset(56, 34)
+        jb.Position = UDim2.new(1, -62, 0, 4)
+        jb.BackgroundColor3 = Color3.fromRGB(255, 150, 40)
+        jb.Font = Enum.Font.GothamBold
+        jb.TextSize = 12
+        jb.TextColor3 = Color3.fromRGB(30, 20, 5)
+        jb.Text = "JOIN"
+        jb.Parent = row
+        local jc = Instance.new("UICorner")
+        jc.CornerRadius = UDim.new(0, 6)
+        jc.Parent = jb
+        jb.MouseButton1Click:Connect(function() joinServer(e.jobId) end)
+    end
+end
+
+local function syncButtons()
+    btnAuto.Text = FILTER.auto and ("AUTO " .. FILTER.interval .. "s") or "AUTO OFF"
+    btnAuto.TextColor3 = FILTER.auto and C_ACCENT or C_DIM
+    btnMinVal.Text = "MIN " .. (FILTER.minValue > 0 and fmtValue(FILTER.minValue) or "Any")
+    btnRarity.Text = "RARITY " .. (FILTER.rarity == "any" and "Any" or FILTER.rarity)
+end
+
+local minIdx, rarIdx = 1, 1
+btnMinVal.MouseButton1Click:Connect(function()
+    minIdx = minIdx % #VALUE_STEPS + 1
+    FILTER.minValue = VALUE_STEPS[minIdx]
+    syncButtons()
+    pcall(renderFinder)
+end)
+btnRarity.MouseButton1Click:Connect(function()
+    rarIdx = rarIdx % #RARITY_STEPS + 1
+    FILTER.rarity = RARITY_STEPS[rarIdx]
+    syncButtons()
+    pcall(renderFinder)
+end)
+btnClear.MouseButton1Click:Connect(function()
+    feed.entries = {}
+    saveFeed()
+    pcall(renderFinder)
+    notify("Feed dibersihkan", 2)
+end)
+btnAuto.MouseButton1Click:Connect(function()
+    if not FILTER.auto then
+        FILTER.auto = true
+        FILTER.interval = 5
+    elseif FILTER.interval == 5 then FILTER.interval = 10
+    elseif FILTER.interval == 10 then FILTER.interval = 15
+    elseif FILTER.interval == 15 then FILTER.interval = 30
+    else FILTER.auto = false end
+    state.lastHop = 0
+    syncButtons()
+    notify(FILTER.auto and ("AUTO ON — hop tiap " .. FILTER.interval .. "s") or "AUTO OFF", 3)
+end)
 
 --─────────────────────────────────────────────────────────────────────────────
 -- SHARED WIDGET HELPERS
@@ -916,7 +1277,7 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v2"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v3"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -939,8 +1300,75 @@ end
 
 local function listLoop()
     while state.alive do
+        if finderPage.Visible then pcall(renderFinder) end
         if eggPage.Visible then pcall(renderEggList) end
         task.wait(1)
+    end
+end
+
+-- perekam feed: scan egg di server sekarang → catat ke feed lokal
+local function feedLoop()
+    while state.alive do
+        task.wait(3)
+        local added = false
+        for inst, data in pairs(state.eggs) do
+            if inst.Parent and data.part and data.part.Parent then
+                local name, value, mult, mut = extractInfo(inst, data.part, data.label)
+                local rar = lower(mut or data.rarity or "common")
+                if (value and value >= 1e6) or rar ~= "common" then
+                    local job = game.JobId
+                    if job and job ~= "" then
+                        local isNew = addFeedEntry({
+                            name   = name or data.name or inst.Name,
+                            rarity = rar,
+                            value  = value or 0,
+                            mult   = mult or 0,
+                            jobId  = job,
+                            ts     = os.time(),
+                        })
+                        if isNew then added = true end
+                    end
+                end
+            end
+        end
+        if added then
+            saveFeed()
+            if finderPage.Visible then pcall(renderFinder) end
+        end
+    end
+end
+
+-- AUTO: server-hopping sampai egg lolos filter ketemu
+local function autoLoop()
+    while state.alive do
+        task.wait(0.5)
+        if FILTER.auto and os.clock() - (state.lastHop or 0) >= FILTER.interval then
+            state.lastHop = os.clock()
+            local haveMatch = false
+            for inst, data in pairs(state.eggs) do
+                local _, value, _, mut = extractInfo(inst, data.part, data.label)
+                if matchesFilters({ value = value or 0, rarity = mut or data.rarity }) then
+                    haveMatch = true
+                    break
+                end
+            end
+            if haveMatch then
+                notify("Target lolos filter ada di server ini!", 4)
+            else
+                local target = pickHopTarget()
+                if target then
+                    feed.visited[target] = os.time()
+                    feed.visited[game.JobId] = os.time()
+                    saveFeed()
+                    notify("AUTO: hop ke server baru...", 3)
+                    task.wait(0.2)
+                    joinServer(target)
+                else
+                    notify("AUTO: tidak ada kandidat server — refresh manual", 4)
+                    pcall(fetchServers)
+                end
+            end
+        end
     end
 end
 
@@ -970,11 +1398,14 @@ closeBtn.MouseButton1Click:Connect(unload)
 --────────────────────────────────────────────────────────────────────────────
 -- BOOT
 --─────────────────────────────────────────────────────────────────────────────
-setTab("egg")
+loadFeed()
+setTab("finder")
+syncButtons()
+pcall(renderFinder)
 if PLACE_ID ~= 107778070777162 then
     notify("Bukan place SAE — fitur egg bisa kosong", 5)
 else
-    notify("Loaded. Tab SERVERS untuk pindah server.", 4)
+    notify("Loaded. Tab FINDER = daftar egg, AUTO = server-hop.", 4)
 end
 
 _G.SAE_EGGF = {
@@ -999,6 +1430,8 @@ task.spawn(scanLoop)
 task.spawn(tpLoop)
 task.spawn(statusLoop)
 task.spawn(listLoop)
+task.spawn(feedLoop)
+task.spawn(autoLoop)
 task.spawn(function()
     task.wait(0.5)
     pcall(fetchServers)
