@@ -1,10 +1,25 @@
 --[[═══════════════════════════════════════════════════════════════════════════
-    SAE — EGG FINDER  +  SERVER BROWSER
+    SAE — EGG FINDER + SERVER BROWSER  ·  v5
     Game   : Steal An Egg (place 107778070777162)
     Build  : keyless, no password, no HWID, no remote loader
-    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=1"))()
-    Tabs   : [EGG FINDER] [SERVERS]
+    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=5"))()
+    Tabs   : [FINDER] [ESP] [SERVERS]
     Keys   : RIGHT-SHIFT = toggle UI      END = unload
+
+    v5 changes
+      · deteksi UNION per-objek (strict+name+label digabung, bukan fallback)
+      · pending-watchlist 90s: telur yang datanya telat di-re-parse terus
+      · event-driven: DescendantAdded → telur baru masuk di frame dia spawn
+      · filter MUTATION & RARITY terpisah (7 mutasi, ladder 10 tier resmi:
+        Common<Uncommon<Rare<Epic<Legendary<Cosmic<Mythic<Secret<Eternal<Divine)
+      · value fallback dari DB 122 pet (wiki snapshot) → tampil "~$X/s"
+      · feed per-server: x/7 pemain, ≤4/7 default, server ★TOP-10 boleh ≤6/7
+        (7/7 selalu dibuang), 6/7 ditandai "1 SLOT RACE"
+      · sort value desc (terberat dulu), tiebreak pemain tersedikit
+      · JOIN pre-check jumlah pemain live (API servers/Public)
+      · catatan server >300s (siklus reset All-Egg) auto-dihapus
+      · opsi WAIT RESET: AUTO hop hanya di jendela ±25s setelah tick reset 5 menit
+      · tanpa gambar pet (anti-lag, by design)
 ═══════════════════════════════════════════════════════════════════════════]]
 
 if _G.SAE_EGGF then
@@ -27,7 +42,7 @@ local LP = Players.LocalPlayer
 local PLACE_ID = game.PlaceId
 
 --─────────────────────────────────────────────────────────────────────────────
--- CONFIG  (tune here if the game renames things)
+-- CONFIG
 --─────────────────────────────────────────────────────────────────────────────
 local CONFIG = {
     scanInterval  = 0.6,
@@ -38,29 +53,157 @@ local CONFIG = {
     tpOffset      = 4,
     tpCooldown    = 1.5,
     maxRendered   = 120,
+    resetCycle    = 300,   -- All-Egg Reset ±300s (terverifikasi)
+    pendingWindow = 90,    -- telur tanpa data dikejar 90 detik
+    feedExpiry    = 300,   -- catatan server lebih tua = hapus
 }
 
+-- ladder rarity resmi (Cosmic DI TENGAH — khas SAE)
+local RARITY_ORDER = { "common", "uncommon", "rare", "epic", "legendary",
+                       "cosmic", "mythic", "secret", "eternal", "divine" }
 local RARITY = {
     common    = Color3.fromRGB(180, 180, 180),
     uncommon  = Color3.fromRGB( 90, 220, 110),
     rare      = Color3.fromRGB( 80, 160, 255),
     epic      = Color3.fromRGB(180, 100, 240),
     legendary = Color3.fromRGB(255, 175, 60),
-    mythic    = Color3.fromRGB(255, 80, 120),
+    cosmic    = Color3.fromRGB(150,  90, 255),
+    mythic    = Color3.fromRGB(255,  80, 120),
     secret    = Color3.fromRGB(255, 240, 120),
-    divine    = Color3.fromRGB(140, 255, 240),
-    godly     = Color3.fromRGB(255, 120, 255),
+    eternal   = Color3.fromRGB(255, 255, 180),
+    divine    = Color3.fromRGB( 60, 255, 220),
 }
 
+--─────────────────────────────────────────────────────────────────────────────
+
+--─────────────────────────────────────────────────────────────────────────────
+-- MUTASI (7) — display name, nama internal config, multiplier
+-- stacking ADDITIF: eff = 1 + Σ(scalar − 1)
+--─────────────────────────────────────────────────────────────────────────────
+local MUT_MULT = {
+    ["Silver"]       = 1.2,
+    ["Golden"]       = 2.5,
+    ["Rainbow"]      = 3.5,
+    ["Bloom"]        = 1.25,
+    ["Spirit Bloom"] = 2.5,
+    ["Parasite"]     = 3.0,
+    ["Fractured"]    = 2.75,
+}
+local MUT_COLORS = {
+    ["Silver"]       = Color3.fromRGB(200, 210, 225),
+    ["Golden"]       = Color3.fromRGB(255, 200, 60),
+    ["Rainbow"]      = Color3.fromRGB(255, 110, 220),
+    ["Bloom"]        = Color3.fromRGB(255, 140, 190),
+    ["Spirit Bloom"] = Color3.fromRGB(120, 255, 200),
+    ["Parasite"]     = Color3.fromRGB(150, 255,  90),
+    ["Fractured"]    = Color3.fromRGB(255, 120,  70),
+}
+-- token teks → nama kanonik (urutan panjang dulu biar "spirit bloom" tak kepacak "bloom")
+local MUT_TOKENS = {
+    { tok = "spirit bloom", can = "Spirit Bloom" },
+    { tok = "greatbloom",   can = "Spirit Bloom" },
+    { tok = "silver",       can = "Silver"       },
+    { tok = "golden",       can = "Golden"       },
+    { tok = "rainbow",      can = "Rainbow"      },
+    { tok = "parasite",     can = "Parasite"     },
+    { tok = "monstrous",    can = "Parasite"     },
+    { tok = "fractured",    can = "Fractured"    },
+    { tok = "sakura",       can = "Bloom"        },
+    { tok = "bloom",        can = "Bloom"        },
+    { tok = "boss",         can = "Fractured"    }, -- diproses SETELAH nama pet dibuang
+}
+
+local function mutEffMult(muts)
+    local eff = 1
+    for _, m in ipairs(muts or {}) do
+        local sc = MUT_MULT[m]
+        if sc then eff = eff + (sc - 1) end
+    end
+    return eff
+end
+
+--─────────────────────────────────────────────────────────────────────────────
+-- PET DB (fallback value) — snapshot wiki 2026-09-28, 106 slot + 16 lead
+-- [nama-lowercase] = { income_per_detik, "Rarity" }
+--─────────────────────────────────────────────────────────────────────────────
+local PET_DB = {
+    ["chicken"]={1,"Common"},["dog"]={2,"Common"},["bird"]={8,"Uncommon"},
+    ["burrowing owl"]={35,"Rare"},["owl"]={35,"Rare"},["raccoon"]={45,"Rare"},
+    ["bear"]={240,"Epic"},["fox"]={180,"Epic"},["brr brr patapim"]={1800,"Legendary"},
+    ["frog"]={3,"Common"},["duckling"]={4,"Common"},["catfish"]={12,"Uncommon"},
+    ["turtle"]={60,"Rare"},["trulimero trulicina"]={260,"Epic"},["swan"]={320,"Epic"},
+    ["axolotl"]={2800,"Legendary"},["leviathan"]={220000,"Cosmic"},
+    ["jerboa"]={6,"Common"},["fennec"]={18,"Uncommon"},["camel"]={75,"Rare"},
+    ["tob tobi tob tob"]={325,"Epic"},["snake"]={3600,"Legendary"},
+    ["sand spider"]={16000,"Mythic"},["scorpion"]={18500,"Mythic"},
+    ["royal sphinx"]={280000,"Cosmic"},
+    ["chimpanzee"]={90,"Rare"},["toucan"]={110,"Rare"},["crocodile"]={420,"Epic"},
+    ["gorilla"]={4800,"Legendary"},["orangutini ananassini"]={5500,"Legendary"},
+    ["spider"]={22000,"Mythic"},["tiger"]={28000,"Mythic"},["king snake"]={3500000,"Secret"},
+    ["penguin"]={140,"Rare"},["walrus"]={600,"Epic"},["polar bear"]={7000,"Legendary"},
+    ["sabertooth tiger"]={35000,"Mythic"},["mammoth"]={42000,"Mythic"},
+    ["king mammoth"]={400000,"Cosmic"},["yeti"]={5000000,"Secret"},
+    ["ice dragon"]={65000000,"Eternal"},
+    ["lava gecko"]={180,"Rare"},["lava frog"]={850,"Epic"},["lavafrog"]={850,"Epic"},
+    ["flaming bull"]={9500,"Legendary"},["lava iguana"]={11000,"Legendary"},
+    ["chillin chilli"]={55000,"Mythic"},["cerberus"]={8000000,"Secret"},
+    ["phoenix"]={85000000,"Eternal"},["lava dragon"]={100000000,"Eternal"},
+    ["parrotfish"]={220,"Rare"},["swordfish"]={1100,"Epic"},["shark"]={15000,"Legendary"},
+    ["orca"]={80000,"Mythic"},["whale shark"]={700000,"Cosmic"},
+    ["beluga whale"]={850000,"Cosmic"},["kraken"]={15000000,"Secret"},
+    ["el maja"]={130000000,"Eternal"},
+    ["dodo"]={280,"Rare"},["pterodactyl"]={22000,"Legendary"},
+    ["ankylosaurus"]={120000,"Mythic"},["triceratops"]={1200000,"Cosmic"},
+    ["bronto"]={1500000,"Cosmic"},["t-rex"]={25000000,"Secret"},["trex"]={25000000,"Secret"},
+    ["tralaledon"]={32000000,"Secret"},["mosasaurus"]={180000000,"Eternal"},
+    ["centapede"]={1500,"Epic"},["cosmic gecko"]={30000,"Legendary"},
+    ["cosmic gorilla"]={180000,"Mythic"},["la vacca saturno saturnita"]={2200000,"Cosmic"},
+    ["cosmic skeleton boss"]={45000000,"Secret"},["cosmic dragon"]={60000000,"Secret"},
+    ["eternal lunar dragon"]={250000000,"Eternal"},["unicorn"]={1000000000,"Divine"},
+    ["crane"]={4000,"Epic"},["salamander"]={74000,"Legendary"},
+    ["red panda"]={450000,"Mythic"},["snowy owl"]={7500000,"Cosmic"},
+    ["koi"]={12000000,"Cosmic"},["stag"]={145000000,"Secret"},
+    ["oni tiger"]={600000000,"Eternal"},["kitsune"]={1800000000,"Divine"},
+    ["spideron"]={95000,"Legendary"},["crustacia"]={130000,"Legendary"},
+    ["bladehide"]={750000,"Mythic"},["mantaris"]={11000000,"Cosmic"},
+    ["rhinotaur"]={17500000,"Cosmic"},["mutant shark"]={215000000,"Secret"},
+    ["gorilla king"]={880000000,"Eternal"},["nightflame"]={3000000000,"Divine"},
+    ["scorpio"]={10000,"Legendary"},["froggo"]={50000,"Mythic"},
+    ["crawler"]={1500000,"Cosmic"},["crocodon"]={30000000,"Secret"},
+    ["krakenoid"]={500000000,"Eternal"},["dreadscale"]={2000000000,"Divine"},
+    ["mecha scorpio"]={45000000,"Secret"},["mecha froggo"]={155000000,"Secret"},
+    ["mecha crawler"]={320000000,"Cosmic"},["mecha crocodon"]={680000000,"Eternal"},
+    ["mecha krakenoid"]={1000000000,"Eternal"},["mecha dreadscale"]={4000000000,"Divine"},
+    ["tung tung sahur"]={100,"Rare"},["bananita dolphinita"]={400,"Epic"},
+    ["belula beluga"]={40000,"Mythic"},["mangolini parrochini"]={800000,"Cosmic"},
+    ["bomboclat crocolat"]={20000000,"Secret"},["strawberry elephant"]={110000000,"Eternal"},
+    ["drilla"]={137000000,"Cosmic"},
+    ["rift eye"]={11000,"Legendary"},["void angler"]={30000,"Legendary"},
+    ["riftwing"]={220000,"Mythic"},["shardling"]={450000,"Mythic"},
+    ["voidmaw"]={50000,"Mythic"},["dreadclaw"]={2200000,"Cosmic"},
+    ["shattered ram"]={8000000,"Cosmic"},["ventinal"]={585000,"Cosmic"},
+    ["mawbreaker"]={60000000,"Secret"},["shardwing"]={145000000,"Secret"},
+    ["wendigo"]={15000000,"Secret"},["shattered drake"]={800000000,"Eternal"},
+    ["void serpent"]={900000000,"Eternal"},["world eater"]={500000000,"Eternal"},
+    ["shattered colossus"]={3500000000,"Divine"},
+}
+
+--─────────────────────────────────────────────────────────────────────────────
+-- STATE
+--─────────────────────────────────────────────────────────────────────────────
 local state = {
-    eggs       = {},          -- [Instance] = { part = BasePart, rarity = string }
-    espCache   = {},          -- [Instance] = { billboard, highlight }
+    eggs       = {},          -- [Instance] = { part, rarity, name, value, mult, muts, est, firstSeen, pending, since }
+    espCache   = {},
     rendered   = 0,
     autoTPOn   = false,
     lastTP     = 0,
-    servers    = {},
+    lastHop    = 0,
+    servers    = {},          -- server browser: { {id, playing, max, ping} }
+    srvById    = {},          -- [jobId] = server ref (untuk pre-check JOIN)
+    srvAt      = 0,           -- waktu fetch terakhir
     currentJob = nil,
     fetching   = false,
+    scanMode   = "-",
     alive      = true,
 }
 
@@ -89,7 +232,6 @@ local function matchesKeyword(name)
     return false
 end
 
--- egg must sit inside an "egg"-ish container, or carry a Rarity attribute
 local function inEggContainer(inst)
     local ok, res = pcall(function()
         local node = inst.Parent
@@ -122,7 +264,7 @@ local function rarityOf(inst)
     local viaAttr = attrRarity(inst)
     if viaAttr then return viaAttr end
     local n = lower(inst.Name)
-    for key in pairs(RARITY) do
+    for _, key in ipairs(RARITY_ORDER) do
         if string.find(n, key, 1, true) then return key end
     end
     return "common"
@@ -132,9 +274,6 @@ local function getPart(inst)
     if inst:IsA("BasePart") then return inst end
     if inst:IsA("Model") then
         return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
-    end
-    if inst:IsA("Folder") or inst:IsA("Model") then
-        return inst:FindFirstChildWhichIsA("BasePart", true)
     end
     return nil
 end
@@ -147,25 +286,27 @@ local function distTo(part)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- FINDER FEED — keyless local feed, persist via executor storage
+-- FORMAT
 --─────────────────────────────────────────────────────────────────────────────
-local FILTER = { minValue = 0, rarity = "any", auto = false, interval = 5 }
-local joinServer, fetchServers, pickHopTarget  -- forward declarations
+local FILTER = {
+    auto       = false,
+    interval   = 5,
+    minValue   = 0,
+    rarity     = "any",   -- ladder lower
+    mut        = "any",   -- display lower ("spirit bloom" dll)
+    maxPlayers = 4,       -- server biasa ≤4/7; ★TOP ≤6/7; 7/7 selalu buang
+    waitReset  = false,   -- hop hanya di jendela setelah tick reset 5 menit
+}
+local joinServer, joinFinderServer, fetchServers, pickHopTarget  -- forward
 
 local VALUE_STEPS  = { 0, 1e6, 1e8, 1e9, 1e10, 1e11, 1e12 }
-local RARITY_STEPS = { "any", "golden", "rainbow", "mythic", "secret", "divine" }
-
-local MUT_COLORS = {
-    golden  = Color3.fromRGB(255, 200, 60),
-    rainbow = Color3.fromRGB(255, 120, 220),
-    mythic  = Color3.fromRGB(255, 80, 120),
-    secret  = Color3.fromRGB(255, 240, 120),
-    divine  = Color3.fromRGB(140, 255, 240),
-    godly   = Color3.fromRGB(255, 120, 255),
-}
+local RARITY_STEPS = { "any", "common", "uncommon", "rare", "epic", "legendary",
+                       "cosmic", "mythic", "secret", "eternal", "divine" }
+local MUT_STEPS    = { "any", "silver", "golden", "rainbow", "bloom",
+                       "spirit bloom", "parasite", "fractured" }
 
 local FEED_FILE = "chilli_sae_feed.json"
-local feed = { entries = {}, visited = {} }
+local feed = { servers = {}, visited = {} }   -- servers[jobId] = { jobId, ts, lastSeen, players, max, eggs={...} }
 
 local function fmtValue(n)
     if not n or n <= 0 then return "-" end
@@ -183,9 +324,9 @@ end
 local function fmtAge(ts)
     local d = os.time() - (ts or os.time())
     if d < 0 then d = 0 end
-    if d < 60 then return d .. "s ago" end
-    if d < 3600 then return math.floor(d / 60) .. "m ago" end
-    return math.floor(d / 3600) .. "h ago"
+    if d < 60 then return d .. "s" end
+    if d < 3600 then return math.floor(d / 60) .. "m" end
+    return math.floor(d / 3600) .. "h"
 end
 
 local function loadFeed()
@@ -193,7 +334,7 @@ local function loadFeed()
     if ok and type(txt) == "string" and #txt > 2 then
         local okd, dec = pcall(HttpService.JSONDecode, HttpService, txt)
         if okd and type(dec) == "table" then
-            feed.entries = dec.entries or {}
+            feed.servers = dec.servers or {}
             feed.visited = dec.visited or {}
         end
     end
@@ -205,24 +346,11 @@ local function saveFeed()
     end)
 end
 
-local function addFeedEntry(e)
-    local key = (e.jobId or "") .. "|" .. (e.name or "") .. "|" ..
-        tostring(e.value) .. "|" .. tostring(math.floor((e.ts or 0) / 30))
-    for _, ex in ipairs(feed.entries) do
-        if ex.key == key then return false end
-    end
-    e.key = key
-    table.insert(feed.entries, 1, e)
-    if #feed.entries > 200 then table.remove(feed.entries) end
-    return true
-end
-
-local function matchesFilters(e)
-    if FILTER.minValue > 0 and (e.value or 0) < FILTER.minValue then return false end
-    if FILTER.rarity ~= "any" and lower(e.rarity or "") ~= FILTER.rarity then return false end
-    return true
-end
-
+--─────────────────────────────────────────────────────────────────────────────
+-- PARSER LABEL → (nama, value, mult, muts, rarity)
+-- urutan: cocokkan nama pet dulu (buang dari teks) → baru token mutasi,
+-- supaya "Cosmic Skeleton Boss" tidak salah terbaca mutasi Fractured.
+--─────────────────────────────────────────────────────────────────────────────
 local function parseMoney(text)
     local num, suf = string.match(text, "%$([%d%.]+)%s*(%a?)%s*/s")
     if num then
@@ -240,7 +368,13 @@ local function parseMult(text)
     return nil
 end
 
--- baca label di sekitar objek: nama, $/s, x-multiplier, mutasi (golden/rainbow/...)
+local function blankOut(s, pattern)
+    local i = string.find(s, pattern, 1, true)
+    if not i then return s, false end
+    local j = i + #pattern - 1
+    return string.sub(s, 1, i - 1) .. string.rep(" ", #pattern) .. string.sub(s, j + 1), true
+end
+
 local function extractInfo(inst, part, fallbackLabel)
     local texts = {}
     if fallbackLabel then table.insert(texts, fallbackLabel) end
@@ -258,32 +392,88 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end)
 
-    local value, mult, mutation
-    local nameTxt, nameScore = nil, -1
+    local value, mult, nameTxt
+    local muts = {}
+    local rarityTxt
+    local dbBase, dbRar
+
+    -- gabung teks untuk pencarian nama & mutasi
+    local low = lower(table.concat(texts, " | "))
+
+    -- 1) nama pet via DB: kandidat penuh dulu ("cosmic skeleton boss" aman),
+    --    lalu varian tanpa kata mutasi ("golden kitsune" → "kitsune")
+    for _, t in ipairs(texts) do
+        local cand0 = lower(t)
+        cand0 = string.gsub(cand0, "%s*egg%s*$", "")
+        cand0 = string.gsub(cand0, "^big%s+", "")
+        local hitName
+        if PET_DB[cand0] then
+            hitName = cand0
+        else
+            local cand1 = cand0
+            for _, tk in ipairs(MUT_TOKENS) do
+                cand1 = string.gsub(cand1, tk.tok .. "%s*", "")
+                cand1 = string.gsub(cand1, "%s*" .. tk.tok, "")
+            end
+            cand1 = string.match(cand1, "^%s*(.-)%s*$") or cand1
+            if PET_DB[cand1] then hitName = cand1 end
+        end
+        if hitName then
+            dbBase, dbRar = PET_DB[hitName][1], PET_DB[hitName][2]
+            nameTxt = hitName
+            low = blankOut(low, lower(t))
+            break
+        end
+    end
+
+    -- 2) rarity via teks
+    for _, r in ipairs(RARITY_ORDER) do
+        if string.find(low, r, 1, true) then
+            rarityTxt = r
+            break
+        end
+    end
+
+    -- 3) mutasi: token terpanjang dulu, habis match dibuang dari teks
+    for _, tk in ipairs(MUT_TOKENS) do
+        local found
+        low, found = blankOut(low, tk.tok)
+        if found then
+            local dup = false
+            for _, m in ipairs(muts) do if m == tk.can then dup = true end end
+            if not dup then table.insert(muts, tk.can) end
+        end
+    end
+
+    -- 4) value & multiplier per teks
     for _, t in ipairs(texts) do
         local v = parseMoney(t)
         if v and not value then value = v end
         local m = parseMult(t)
         if m and not mult then mult = m end
-        local low = lower(t)
-        for mut in pairs(MUT_COLORS) do
-            if string.find(low, mut, 1, true) and not mutation then mutation = mut end
-        end
-        if not string.find(t, "%$") and not string.find(t, "x%s*[%d%.]") then
-            local letters = 0
-            for i = 1, #t do
-                local c = string.sub(t, i, i)
-                if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == " " then
-                    letters = letters + 1
+    end
+
+    -- 5) nama tampilan terbaik (teks tanpa $ / xN yang paling panjang)
+    if not nameTxt then
+        local score = -1
+        for _, t in ipairs(texts) do
+            if not string.find(t, "%$") and not string.find(t, "x%s*[%d%.]") then
+                local letters = 0
+                for i = 1, #t do
+                    local c = string.sub(t, i, i)
+                    if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == " " then
+                        letters = letters + 1
+                    end
                 end
-            end
-            if letters > nameScore and letters >= 3 then
-                nameScore = letters
-                nameTxt = t
+                if letters > score and letters >= 3 then
+                    score = letters
+                    nameTxt = t
+                end
             end
         end
     end
-    return nameTxt, value, mult, mutation
+
+    return nameTxt, value, mult, muts, rarityTxt, dbBase, dbRar
 end
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -333,67 +523,76 @@ local function buildESP(inst, part, rarity, displayName)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- SCAN LOOP
---────────────────────────────────────────────────────────────────────────────
+-- DETEKSI v5 — UNION per-objek (strict ∪ name ∪ label, bukan fallback berlapis)
+--─────────────────────────────────────────────────────────────────────────────
+local function eggEntry(inst)
+    local part = getPart(inst)
+    if not part then return nil end
+    return {
+        part = part,
+        rarity = rarityOf(inst),
+        firstSeen = os.time(),
+        pending = true,
+        since = os.clock(),
+    }
+end
+
+local function addEgg(inst, entry)
+    if state.eggs[inst] then return end
+    local char = LP.Character
+    if char and inst:IsDescendantOf(char) then return end
+    if inst:IsA("Model") and inst:FindFirstChildOfClass("Humanoid") then return end
+    state.eggs[inst] = entry or eggEntry(inst)
+end
+
 local function collectEggs()
-    -- 3 lapis: strict (folder/attribute) → name (nama mengandung egg) → label (BillboardGui ber-teks egg)
-    local strict, nameOnly, labelOnly = {}, {}, {}
+    local result = {}
 
-    local ok = pcall(function()
-        local claimed = {}
-        local function isClaimed(inst)
-            local node = inst
-            for _ = 1, 5 do
-                if claimed[node] then return true end
-                node = node.Parent
-                if not node or node == Workspace then break end
-            end
-            return false
-        end
-
+    -- pass 1: nama mengandung keyword (strict bila di container egg / beratribut)
+    pcall(function()
         for _, inst in ipairs(Workspace:GetDescendants()) do
             local isPart  = inst:IsA("BasePart")
             local isModel = inst:IsA("Model")
             if (isPart or isModel)
-            and inst ~= LP.Character
-            and not (LP.Character and inst:IsDescendantOf(LP.Character)) then
-                local humanoid = isModel and inst:FindFirstChildOfClass("Humanoid")
-                if not humanoid and not isClaimed(inst) and matchesKeyword(inst.Name) then
-                    local part = getPart(inst)
-                    if part then
-                        local entry = { part = part, rarity = rarityOf(inst) }
-                        if inEggContainer(inst) or attrRarity(inst) then
-                            strict[inst] = entry
-                        else
-                            nameOnly[inst] = entry
-                        end
-                        claimed[inst] = true
+            and inst ~= LP.Character then
+                if matchesKeyword(inst.Name) then
+                    local entry = eggEntry(inst)
+                    if entry then
+                        entry.strict = inEggContainer(inst) or (attrRarity(inst) ~= nil)
+                        result[inst] = entry
                     end
                 end
             end
         end
+    end)
 
-        -- pass 3: label di atas telur (nama model generik)
-        if not next(strict) and not next(nameOnly) then
-            for _, inst in ipairs(Workspace:GetDescendants()) do
-                if inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
-                    local txt
-                    for _, ch in ipairs(inst:GetDescendants()) do
-                        if ch:IsA("TextLabel") and matchesKeyword(ch.Text) then
-                            txt = ch.Text
-                            break
-                        end
+    -- pass 2: label Billboard (telur reload 5 menit sering model generik)
+    pcall(function()
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
+                local txt
+                for _, ch in ipairs(inst:GetDescendants()) do
+                    if ch:IsA("TextLabel") and ch.Text and #ch.Text > 2 then
+                        txt = ch.Text
+                        break
                     end
-                    if txt then
-                        local target
-                        if inst.Adornee and inst.Adornee:IsA("BasePart") then
-                            target = inst.Adornee
-                        elseif inst.Parent and inst.Parent:IsA("BasePart") then
-                            target = inst.Parent
-                        end
-                        if target and not claimed[target] then
-                            labelOnly[target] = { part = target, rarity = rarityOf(target), label = txt, name = txt }
-                            claimed[target] = true
+                end
+                if txt and (matchesKeyword(txt) or parseMoney(txt)) then
+                    local target
+                    if inst.Adornee and inst.Adornee:IsA("BasePart") then
+                        target = inst.Adornee
+                    elseif inst.Parent and inst.Parent:IsA("BasePart") then
+                        target = inst.Parent
+                    end
+                    if target and not result[target.Parent] and not result[target] then
+                        local own = result[target]
+                        if not own then
+                            own = { part = target, rarity = rarityOf(target), firstSeen = os.time(),
+                                    pending = true, since = os.clock(), label = txt, viaLabel = true }
+                            result[target] = own
+                        else
+                            own.label = txt
+                            own.viaLabel = true
                         end
                     end
                 end
@@ -401,30 +600,68 @@ local function collectEggs()
         end
     end)
 
-    if not ok then return state.eggs end
-    if next(strict)    then state.scanMode = "strict"; return strict    end
-    if next(nameOnly)  then state.scanMode = "name";   return nameOnly  end
-    if next(labelOnly) then state.scanMode = "label";  return labelOnly end
-    state.scanMode = "none"
-    return {}
+    if next(result) then
+        state.scanMode = "union"
+    else
+        state.scanMode = "none"
+    end
+    return result
+end
+
+local function resolvePending(inst)
+    local data = state.eggs[inst]
+    if not data or not data.pending then return end
+    if os.clock() - (data.since or 0) > CONFIG.pendingWindow then
+        data.pending = false
+        return
+    end
+    local name, value, mult, muts, rarTxt, dbBase, dbRar =
+        extractInfo(inst, data.part, data.label)
+    if name then data.name = name end
+    if rarTxt then data.rarity = rarTxt end
+    if not rarTxt and dbRar then data.rarity = lower(dbRar) end
+    if muts and #muts > 0 then data.muts = muts end
+    if value then
+        data.value = value
+        data.est = false
+    elseif dbBase then
+        data.dbBase = dbBase
+        data.value = dbBase * mutEffMult(data.muts)
+        data.est = true
+    end
+    if mult then data.mult = mult end
+    if data.name and data.value and data.value > 0 then
+        data.pending = false
+    end
 end
 
 local function refreshESP()
     local new = collectEggs()
-    state.eggs = new
 
+    -- gabung: yang lama masih hidup dipertahankan datanya
     for inst in pairs(state.espCache) do
         if not new[inst] or not inst.Parent or not CONFIG.esp then destroyESP(inst) end
     end
+    local merged = {}
+    for inst, entry in pairs(new) do
+        local old = state.eggs[inst]
+        if old then
+            old.part = entry.part
+            if entry.label and not old.label then old.label = entry.label end
+            merged[inst] = old
+        else
+            merged[inst] = entry
+        end
+    end
+    state.eggs = merged
 
     if not CONFIG.esp then
         state.rendered = 0
         return
     end
 
-    -- nearest-first ordering so the cap keeps useful entries
     local list = {}
-    for inst, data in pairs(new) do
+    for inst, data in pairs(state.eggs) do
         local d = distTo(data.part)
         if d <= CONFIG.maxDistance then
             table.insert(list, { inst = inst, data = data, d = d })
@@ -449,8 +686,53 @@ local function scanLoop()
     end
 end
 
+-- pending-watchlist: telur yang datanya telat muncul (reload 5 menit) dikejar 90s
+local function pendingLoop()
+    while state.alive do
+        task.wait(1)
+        for inst, data in pairs(state.eggs) do
+            if data.pending and inst.Parent then
+                pcall(resolvePending, inst)
+            end
+        end
+    end
+end
+
+-- event-driven: telur baru masuk di frame dia spawn
+Workspace.DescendantAdded:Connect(function(inst)
+    if not state.alive then return end
+    pcall(function()
+        if inst:IsA("BasePart") or inst:IsA("Model") then
+            if matchesKeyword(inst.Name) or inEggContainer(inst) then
+                addEgg(inst)
+            end
+        elseif inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
+            task.defer(function()
+                if not state.alive or not inst.Parent then return end
+                for _, ch in ipairs(inst:GetDescendants()) do
+                    if ch:IsA("TextLabel") and ch.Text and (matchesKeyword(ch.Text) or parseMoney(ch.Text)) then
+                        local target
+                        if inst.Adornee and inst.Adornee:IsA("BasePart") then
+                            target = inst.Adornee
+                        elseif inst.Parent and inst.Parent:IsA("BasePart") then
+                            target = inst.Parent
+                        end
+                        if target then
+                            addEgg(target, {
+                                part = target, rarity = rarityOf(target), firstSeen = os.time(),
+                                pending = true, since = os.clock(), label = ch.Text, viaLabel = true,
+                            })
+                        end
+                        break
+                    end
+                end
+            end)
+        end
+    end)
+end)
+
 --─────────────────────────────────────────────────────────────────────────────
--- AUTO TELEPORT
+-- AUTO TELEPORT (ESP tab)
 --─────────────────────────────────────────────────────────────────────────────
 local function teleportToEgg()
     if os.clock() - state.lastTP < CONFIG.tpCooldown then return end
@@ -477,7 +759,7 @@ local function teleportToEgg()
         )
         tween:Play()
     end)
-    hrp.CFrame = CFrame.new(target)  -- hard-set so it survives tween cancellation
+    hrp.CFrame = CFrame.new(target)
 end
 
 local function tpLoop()
@@ -488,7 +770,7 @@ local function tpLoop()
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- SERVER BROWSER
+-- HTTP + SERVER LIST
 --─────────────────────────────────────────────────────────────────────────────
 local function httpGet(url)
     local body
@@ -499,16 +781,18 @@ local function httpGet(url)
     return nil
 end
 
-function fetchServers()
-    if state.fetching then return end
+-- excludeFull=true dipakai AUTO biar server penuh tidak dibuang-buang waktu
+function fetchServers(excludeFull)
+    if state.fetching then return state.servers end
     state.fetching = true
     local out, cursor, pages = {}, nil, 0
 
     repeat
         pages = pages + 1
         local url = string.format(
-            "https://games.roblox.com/v1/games/%d/servers/Public?limit=100&sortOrder=Desc&excludeFullGames=false%s",
+            "https://games.roblox.com/v1/games/%d/servers/Public?limit=100&sortOrder=Desc&excludeFullGames=%s%s",
             PLACE_ID,
+            excludeFull and "true" or "false",
             cursor and ("&cursor=" .. cursor) or ""
         )
         local raw = httpGet(url)
@@ -517,12 +801,14 @@ function fetchServers()
         if not ok or type(decoded) ~= "table" then break end
 
         for _, s in ipairs(decoded.data or {}) do
-            table.insert(out, {
+            local ref = {
                 id      = s.id,
                 playing = tonumber(s.playing) or 0,
                 max     = tonumber(s.maxPlayers) or 0,
                 ping    = tonumber(s.ping),
-            })
+            }
+            table.insert(out, ref)
+            state.srvById[ref.id] = ref
         end
         cursor = decoded.nextPageCursor
     until not cursor or pages >= 3
@@ -533,9 +819,25 @@ function fetchServers()
     end)
 
     state.servers = out
+    state.srvAt = os.clock()
     state.fetching = false
-    if #out == 0 then notify("Server list kosong / API diblokir", 4) end
     return out
+end
+
+-- jumlah pemain live: server ini → lokal; server lain → cache API (≤30s)
+local function getLiveCount(jobId)
+    if jobId == game.JobId then
+        return #Players:GetPlayers(), Players.MaxPlayers
+    end
+    local ref = state.srvById[jobId]
+    if ref and os.clock() - state.srvAt < 30 then
+        return ref.playing, ref.max
+    end
+    if os.clock() - state.srvAt >= 30 and not state.fetching then
+        task.spawn(fetchServers, false)
+    end
+    if ref then return ref.playing, ref.max end
+    return nil, nil
 end
 
 function joinServer(jobId)
@@ -554,22 +856,57 @@ function joinServer(jobId)
     end
 end
 
-function pickHopTarget()
-    if #state.servers == 0 then pcall(fetchServers) end
-    local now = os.time()
-    local fallback
-    for _, s in ipairs(state.servers) do
-        if s.id ~= game.JobId and s.playing > 0 and s.playing < s.max then
-            local last = feed.visited[s.id]
-            if not last or now - last > 480 then return s.id end
-            if not fallback then fallback = s.id end
+-- JOIN feed dengan pre-check jumlah pemain:
+--   7/7 = FULL skip · biasa >4/7 skip · ★TOP ≤6/7 boleh (6/7 = RACE 1 slot)
+function joinFinderServer(jobId, isTop)
+    if not jobId or jobId == "" then return end
+    if jobId == game.JobId then notify("Sudah di server itu", 2) return end
+
+    local playing, max = getLiveCount(jobId)
+    if playing then
+        if max and playing >= max then
+            notify("FULL " .. playing .. "/" .. max .. " — skip", 3)
+            return
         end
+        if isTop then
+            if playing >= 6 then
+                notify("RACE! " .. playing .. "/7 — 1 slot, gas cepat", 4)
+            end
+        elseif playing > FILTER.maxPlayers then
+            notify("Skip: " .. playing .. "/7 > batas " .. FILTER.maxPlayers .. "/7", 3)
+            return
+        end
+    else
+        notify("Data pemain belum ada — JOIN blind", 3)
+    end
+    joinServer(jobId)
+end
+
+-- AUTO hop: prioritas server paling kosong (1/7) yang belum dikunjungi
+function pickHopTarget()
+    if #state.servers == 0 or os.clock() - state.srvAt > 60 then
+        pcall(fetchServers, true)
+    end
+    local now = os.time()
+    local cands = {}
+    for _, s in ipairs(state.servers) do
+        if s.id ~= game.JobId and s.playing > 0 and s.max > 0 and s.playing < s.max then
+            table.insert(cands, s)
+        end
+    end
+    table.sort(cands, function(a, b) return a.playing < b.playing end)
+
+    local fallback
+    for _, s in ipairs(cands) do
+        local last = feed.visited[s.id]
+        if not last or now - last > 480 then return s.id end
+        if not fallback then fallback = s.id end
     end
     return fallback
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- UI
+-- UI SHELL
 --────────────────────────────────────────────────────────────────────────────
 local C_BG      = Color3.fromRGB(18, 18, 22)
 local C_PANEL   = Color3.fromRGB(28, 28, 34)
@@ -577,6 +914,7 @@ local C_STROKE  = Color3.fromRGB(58, 58, 70)
 local C_TEXT    = Color3.fromRGB(235, 235, 240)
 local C_DIM     = Color3.fromRGB(150, 150, 162)
 local C_ACCENT  = Color3.fromRGB(120, 220, 150)
+local C_GOLD    = Color3.fromRGB(255, 210, 80)
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "SAE_EggFinder"
@@ -588,8 +926,8 @@ local okParent = pcall(function() gui.Parent = game:GetService("CoreGui") end)
 if not okParent or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(470, 330)
-main.Position = UDim2.new(0.5, -235, 0.5, -165)
+main.Size = UDim2.fromOffset(470, 380)
+main.Position = UDim2.new(0.5, -235, 0.5, -190)
 main.BackgroundColor3 = C_BG
 main.BorderSizePixel = 0
 main.Active = true
@@ -622,7 +960,7 @@ titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
 titleLabel.TextColor3 = C_TEXT
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = "SAE · EGG FINDER"
+titleLabel.Text = "SAE · EGG FINDER v5"
 titleLabel.Parent = titleBar
 
 local closeBtn = Instance.new("TextButton")
@@ -732,48 +1070,58 @@ tabEgg.MouseButton1Click:Connect(function() setTab("egg") end)
 tabServer.MouseButton1Click:Connect(function() setTab("srv") end)
 
 --─────────────────────────────────────────────────────────────────────────────
--- FINDER PAGE — "top recent eggs" keyless
+-- FINDER PAGE v5 — feed per-server, 2 filter terpisah, sort value desc
 --─────────────────────────────────────────────────────────────────────────────
-local btnRow = Instance.new("Frame")
-btnRow.Size = UDim2.new(1, 0, 0, 30)
-btnRow.BackgroundTransparency = 1
-btnRow.Parent = finderPage
+local btnRow1 = Instance.new("Frame")
+btnRow1.Size = UDim2.new(1, 0, 0, 28)
+btnRow1.BackgroundTransparency = 1
+btnRow1.Parent = finderPage
 
-local function makeFilterBtn(text, order)
+local btnRow2 = Instance.new("Frame")
+btnRow2.Size = UDim2.new(1, 0, 0, 28)
+btnRow2.Position = UDim2.fromOffset(0, 30)
+btnRow2.BackgroundTransparency = 1
+btnRow2.Parent = finderPage
+
+local function makeFilterBtn(text, order, parent, cols)
+    cols = cols or 3
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0.25, -3, 1, 0)
-    b.Position = UDim2.new(order * 0.25, order * 4, 0, 0)
+    b.Size = UDim2.new(1 / cols, -4, 1, 0)
+    b.Position = UDim2.new(order / cols, order * 4, 0, 0)
     b.BackgroundColor3 = C_PANEL
     b.Font = Enum.Font.GothamBold
     b.TextSize = 10
     b.TextColor3 = C_TEXT
     b.Text = text
-    b.Parent = btnRow
+    b.Parent = parent
     local c = Instance.new("UICorner")
     c.CornerRadius = UDim.new(0, 5)
     c.Parent = b
     return b
 end
 
-local btnAuto   = makeFilterBtn("AUTO OFF", 0)
-local btnMinVal = makeFilterBtn("MIN Any", 1)
-local btnRarity = makeFilterBtn("RARITY Any", 2)
-local btnClear  = makeFilterBtn("CLEAR", 3)
+local btnAuto  = makeFilterBtn("AUTO OFF", 0, btnRow1, 3)
+local btnMinVal= makeFilterBtn("MIN Any", 1, btnRow1, 3)
+local btnRarity= makeFilterBtn("RARITY Any", 2, btnRow1, 3)
+local btnMut   = makeFilterBtn("MUT Any", 0, btnRow2, 4)
+local btnPlyr  = makeFilterBtn("P<=4", 1, btnRow2, 4)
+local btnReset = makeFilterBtn("RESET-WAIT OFF", 2, btnRow2, 4)
+local btnClear = makeFilterBtn("CLEAR", 3, btnRow2, 4)
 
 local finderSub = Instance.new("TextLabel")
 finderSub.Size = UDim2.new(1, 0, 0, 18)
-finderSub.Position = UDim2.fromOffset(0, 32)
+finderSub.Position = UDim2.fromOffset(0, 60)
 finderSub.BackgroundTransparency = 1
 finderSub.Font = Enum.Font.GothamBold
 finderSub.TextSize = 10
 finderSub.TextColor3 = C_DIM
 finderSub.TextXAlignment = Enum.TextXAlignment.Left
-finderSub.Text = "0 egg tercatat · keyless local feed"
+finderSub.Text = "..."
 finderSub.Parent = finderPage
 
 local finderList = Instance.new("ScrollingFrame")
-finderList.Size = UDim2.new(1, 0, 1, -54)
-finderList.Position = UDim2.fromOffset(0, 54)
+finderList.Size = UDim2.new(1, 0, 1, -82)
+finderList.Position = UDim2.fromOffset(0, 82)
 finderList.BackgroundTransparency = 1
 finderList.BorderSizePixel = 0
 finderList.ScrollBarThickness = 4
@@ -787,23 +1135,104 @@ finderLayout.SortOrder = Enum.SortOrder.LayoutOrder
 finderLayout.Parent = finderList
 
 local function rarityColor(rar)
-    return MUT_COLORS[lower(rar or "")] or RARITY[lower(rar or "")] or RARITY.common
+    return RARITY[lower(rar or "")] or RARITY.common
+end
+
+-- TOP-10 DINAMIS: 10 value terbesar lintas feed; server berisi salah satunya = ★TOP
+local function computeTop()
+    local all = {}
+    local now = os.time()
+    for jobId, srv in pairs(feed.servers) do
+        if now - (srv.lastSeen or 0) <= CONFIG.feedExpiry then
+            for _, e in ipairs(srv.eggs or {}) do
+                if (e.value or 0) > 0 then
+                    table.insert(all, { srv = jobId, egg = e })
+                end
+            end
+        end
+    end
+    table.sort(all, function(a, b) return (a.egg.value or 0) > (b.egg.value or 0) end)
+
+    local topEggs, topServers = {}, {}
+    for i = 1, math.min(#all, 10) do
+        topEggs[i] = all[i].egg
+        topServers[all[i].srv] = true
+    end
+    return topEggs, topServers
+end
+
+local function eggValue(e)
+    return e.value or 0
+end
+
+local function mutText(muts)
+    if not muts or #muts == 0 then return nil end
+    return table.concat(muts, "+")
 end
 
 local function renderFinder()
     for _, ch in ipairs(finderList:GetChildren()) do
-        if ch:IsA("Frame") then ch:Destroy() end
+        if ch:IsA("Frame") or ch:IsA("TextLabel") then ch:Destroy() end
     end
 
-    local shown = {}
-    for _, e in ipairs(feed.entries) do
-        if matchesFilters(e) then
-            table.insert(shown, e)
-            if #shown >= 15 then break end
+    local now = os.time()
+    -- buang server kadaluarsa (>300s = siklus reset)
+    for jobId, srv in pairs(feed.servers) do
+        if now - (srv.lastSeen or 0) > CONFIG.feedExpiry then
+            feed.servers[jobId] = nil
         end
     end
 
-    finderSub.Text = string.format("%d egg tercatat · feed lokal (keyless)", #feed.entries)
+    local topEggs, topServers = computeTop()
+    local topSet = {}
+    for _, e in ipairs(topEggs) do topSet[e] = true end
+
+    -- kumpulkan server lolos filter
+    local shown = {}
+    for jobId, srv in pairs(feed.servers) do
+        local isTop = topServers[jobId] == true
+        -- angka pemain live utk server lain dari cache API (refresh 30s)
+        local live = state.srvById[jobId]
+        if live and os.clock() - state.srvAt < 30 then
+            srv.players = live.playing
+            srv.max = live.max or srv.max
+        end
+        local players = srv.players or 0
+        local cap = srv.max or 7
+        if players < cap then                                  -- 7/7 selalu dibuang
+            if isTop or players <= FILTER.maxPlayers then      -- ★TOP boleh ≤6/7
+                table.insert(shown, { srv = srv, isTop = isTop })
+            end
+        end
+    end
+
+    -- sort: ★TOP dulu → best value desc → pemain tersedikit → terbaru
+    local function bestVal(srv)
+        local b = 0
+        for _, e in ipairs(srv.eggs or {}) do
+            if eggValue(e) > b then b = eggValue(e) end
+        end
+        return b
+    end
+    table.sort(shown, function(a, b)
+        if a.isTop ~= b.isTop then return a.isTop end
+        local bv, bn = bestVal(a.srv), bestVal(b.srv)
+        if bv ~= bn then return bv > bn end
+        if (a.srv.players or 0) ~= (b.srv.players or 0) then
+            return (a.srv.players or 0) < (b.srv.players or 0)
+        end
+        return (a.srv.lastSeen or 0) > (b.srv.lastSeen or 0)
+    end)
+
+    local nEgg, nServer, nTop = 0, 0, 0
+    for jobId, srv in pairs(feed.servers) do
+        nServer = nServer + 1
+        nEgg = nEgg + #(srv.eggs or {})
+        if topServers[jobId] then nTop = nTop + 1 end
+    end
+    local here = #Players:GetPlayers()
+    finderSub.Text = string.format("%d/%d pemain · %d egg · %d server · ★TOP %d · mode:%s",
+        here, Players.MaxPlayers, nEgg, nServer, nTop, state.scanMode or "-")
 
     if #shown == 0 then
         local empty = Instance.new("TextLabel")
@@ -817,75 +1246,188 @@ local function renderFinder()
         return
     end
 
-    for i, e in ipairs(shown) do
-        local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 42)
-        row.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
-        row.LayoutOrder = i
-        row.Parent = finderList
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 5)
-        c.Parent = row
+    local order = 0
+    local maxServers = 12
+    for _, item in ipairs(shown) do
+        if order >= maxServers then break end
+        local srv, isTop = item.srv, item.isTop
+        order = order + 1
 
-        local name = Instance.new("TextLabel")
-        name.Size = UDim2.new(1, -90, 0, 18)
-        name.Position = UDim2.fromOffset(10, 2)
-        name.BackgroundTransparency = 1
-        name.Font = Enum.Font.GothamBold
-        name.TextSize = 12
-        name.TextColor3 = C_TEXT
-        name.TextXAlignment = Enum.TextXAlignment.Left
-        name.TextTruncate = Enum.TextTruncate.AtEnd
-        name.Text = e.name or "?"
-        name.Parent = row
+        -- header server
+        local head = Instance.new("Frame")
+        head.Size = UDim2.new(1, -6, 0, 26)
+        head.BackgroundColor3 = isTop and Color3.fromRGB(46, 38, 18) or Color3.fromRGB(24, 24, 29)
+        head.LayoutOrder = order * 10
+        head.Parent = finderList
+        local hc = Instance.new("UICorner")
+        hc.CornerRadius = UDim.new(0, 5)
+        hc.Parent = head
 
-        local badge = Instance.new("TextLabel")
-        badge.Size = UDim2.fromOffset(74, 16)
-        badge.Position = UDim2.fromOffset(10, 22)
-        badge.BackgroundTransparency = 1
-        badge.Font = Enum.Font.GothamBold
-        badge.TextSize = 10
-        badge.TextColor3 = rarityColor(e.rarity)
-        badge.TextXAlignment = Enum.TextXAlignment.Left
-        badge.Text = e.rarity or "common"
-        badge.Parent = row
+        local topBadge = Instance.new("TextLabel")
+        topBadge.Size = UDim2.fromOffset(46, 18)
+        topBadge.Position = UDim2.fromOffset(6, 4)
+        topBadge.BackgroundTransparency = 1
+        topBadge.Font = Enum.Font.GothamBold
+        topBadge.TextSize = 11
+        topBadge.TextColor3 = isTop and C_GOLD or C_DIM
+        topBadge.TextXAlignment = Enum.TextXAlignment.Left
+        topBadge.Text = isTop and "★TOP" or string.sub(srv.jobId or "", 1, 6)
+        topBadge.Parent = head
 
-        local val = Instance.new("TextLabel")
-        val.Size = UDim2.new(1, -200, 0, 16)
-        val.Position = UDim2.fromOffset(84, 22)
-        val.BackgroundTransparency = 1
-        val.Font = Enum.Font.GothamBold
-        val.TextSize = 10
-        val.TextColor3 = Color3.fromRGB(120, 230, 140)
-        val.TextXAlignment = Enum.TextXAlignment.Left
-        val.Text = (e.value and e.value > 0 and fmtValue(e.value) or "-") ..
-            ((e.mult and e.mult > 0) and ("  x" .. string.format("%.2f", e.mult)) or "")
-        val.Parent = row
+        local plbl = Instance.new("TextLabel")
+        plbl.Size = UDim2.fromOffset(40, 18)
+        plbl.Position = UDim2.new(1, -212, 0, 4)
+        plbl.BackgroundTransparency = 1
+        plbl.Font = Enum.Font.GothamBold
+        plbl.TextSize = 11
+        local pcol = C_ACCENT
+        if (srv.players or 0) >= 5 then pcol = Color3.fromRGB(255, 190, 90) end
+        if isTop and (srv.players or 0) >= 6 then pcol = Color3.fromRGB(255, 140, 60) end
+        plbl.TextColor3 = pcol
+        plbl.TextXAlignment = Enum.TextXAlignment.Right
+        plbl.Text = string.format("%d/%d", srv.players or 0, srv.max or 7)
+        plbl.Parent = head
 
-        local age = Instance.new("TextLabel")
-        age.Size = UDim2.fromOffset(52, 16)
-        age.Position = UDim2.new(1, -140, 0, 22)
-        age.BackgroundTransparency = 1
-        age.Font = Enum.Font.Gotham
-        age.TextSize = 10
-        age.TextColor3 = C_DIM
-        age.TextXAlignment = Enum.TextXAlignment.Right
-        age.Text = fmtAge(e.ts)
-        age.Parent = row
+        local raceLbl = Instance.new("TextLabel")
+        raceLbl.Size = UDim2.fromOffset(80, 18)
+        raceLbl.Position = UDim2.new(1, -170, 0, 4)
+        raceLbl.BackgroundTransparency = 1
+        raceLbl.Font = Enum.Font.GothamBold
+        raceLbl.TextSize = 10
+        raceLbl.TextColor3 = Color3.fromRGB(255, 140, 60)
+        raceLbl.TextXAlignment = Enum.TextXAlignment.Left
+        raceLbl.Text = (isTop and (srv.players or 0) >= 6) and "1 SLOT RACE" or ""
+        raceLbl.Parent = head
+
+        local totLbl = Instance.new("TextLabel")
+        totLbl.Size = UDim2.fromOffset(90, 18)
+        totLbl.Position = UDim2.new(1, -256, 0, 4)
+        totLbl.BackgroundTransparency = 1
+        totLbl.Font = Enum.Font.GothamBold
+        totLbl.TextSize = 10
+        totLbl.TextColor3 = Color3.fromRGB(120, 230, 140)
+        totLbl.TextXAlignment = Enum.TextXAlignment.Right
+        totLbl.Text = fmtValue(bestVal(srv))
+        totLbl.Parent = head
+
+        local ageLbl = Instance.new("TextLabel")
+        ageLbl.Size = UDim2.fromOffset(44, 18)
+        ageLbl.Position = UDim2.new(1, -266, 0, 4)
+        ageLbl.BackgroundTransparency = 1
+        ageLbl.Font = Enum.Font.Gotham
+        ageLbl.TextSize = 10
+        ageLbl.TextColor3 = C_DIM
+        ageLbl.TextXAlignment = Enum.TextXAlignment.Left
+        ageLbl.Text = fmtAge(srv.lastSeen)
+        ageLbl.Parent = head
 
         local jb = Instance.new("TextButton")
-        jb.Size = UDim2.fromOffset(56, 34)
-        jb.Position = UDim2.new(1, -62, 0, 4)
-        jb.BackgroundColor3 = Color3.fromRGB(255, 150, 40)
+        jb.Size = UDim2.fromOffset(52, 18)
+        jb.Position = UDim2.new(1, -56, 0, 4)
+        jb.BackgroundColor3 = isTop and C_GOLD or Color3.fromRGB(255, 150, 40)
         jb.Font = Enum.Font.GothamBold
-        jb.TextSize = 12
+        jb.TextSize = 11
         jb.TextColor3 = Color3.fromRGB(30, 20, 5)
         jb.Text = "JOIN"
-        jb.Parent = row
+        jb.Parent = head
         local jc = Instance.new("UICorner")
-        jc.CornerRadius = UDim.new(0, 6)
+        jc.CornerRadius = UDim.new(0, 5)
         jc.Parent = jb
-        jb.MouseButton1Click:Connect(function() joinServer(e.jobId) end)
+        jb.MouseButton1Click:Connect(function()
+            joinFinderServer(srv.jobId, isTop)
+        end)
+
+        -- baris egg (sort value desc, maks 5 + counter)
+        local eggs = srv.eggs or {}
+        local sorted = {}
+        for _, e in ipairs(eggs) do table.insert(sorted, e) end
+        table.sort(sorted, function(a, b) return eggValue(a) > eggValue(b) end)
+
+        local maxRows = 5
+        for i, e in ipairs(sorted) do
+            if i > maxRows then break end
+            local row = Instance.new("Frame")
+            row.Size = UDim2.new(1, -14, 0, 20)
+            row.Position = UDim2.fromOffset(6, 0)
+            row.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+            row.LayoutOrder = order * 10 + i
+            row.Parent = finderList
+            local rc = Instance.new("UICorner")
+            rc.CornerRadius = UDim.new(0, 4)
+            rc.Parent = row
+
+            local star = Instance.new("TextLabel")
+            star.Size = UDim2.fromOffset(14, 16)
+            star.Position = UDim2.fromOffset(4, 2)
+            star.BackgroundTransparency = 1
+            star.Font = Enum.Font.GothamBold
+            star.TextSize = 11
+            star.TextColor3 = C_GOLD
+            star.Text = topSet[e] and "★" or ""
+            star.Parent = row
+
+            local nm = Instance.new("TextLabel")
+            nm.Size = UDim2.new(1, -210, 0, 16)
+            nm.Position = UDim2.fromOffset(18, 2)
+            nm.BackgroundTransparency = 1
+            nm.Font = Enum.Font.GothamBold
+            nm.TextSize = 11
+            nm.TextColor3 = C_TEXT
+            nm.TextXAlignment = Enum.TextXAlignment.Left
+            nm.TextTruncate = Enum.TextTruncate.AtEnd
+            nm.Text = e.name or "?"
+            nm.Parent = row
+
+            local rarBadge = Instance.new("TextLabel")
+            rarBadge.Size = UDim2.fromOffset(60, 16)
+            rarBadge.Position = UDim2.new(1, -192, 0, 2)
+            rarBadge.BackgroundTransparency = 1
+            rarBadge.Font = Enum.Font.GothamBold
+            rarBadge.TextSize = 10
+            rarBadge.TextColor3 = rarityColor(e.rarity)
+            rarBadge.TextXAlignment = Enum.TextXAlignment.Left
+            rarBadge.Text = string.upper(string.sub(e.rarity or "common", 1, 3)) ..
+                string.sub(e.rarity or "common", 4)
+            rarBadge.Parent = row
+
+            local mutBadge = Instance.new("TextLabel")
+            mutBadge.Size = UDim2.fromOffset(70, 16)
+            mutBadge.Position = UDim2.new(1, -128, 0, 2)
+            mutBadge.BackgroundTransparency = 1
+            mutBadge.Font = Enum.Font.GothamBold
+            mutBadge.TextSize = 10
+            mutBadge.TextColor3 = (e.muts and #e.muts > 0) and MUT_COLORS[e.muts[1]] or C_DIM
+            mutBadge.TextXAlignment = Enum.TextXAlignment.Left
+            mutBadge.Text = mutText(e.muts) or ""
+            mutBadge.Parent = row
+
+            local val = Instance.new("TextLabel")
+            val.Size = UDim2.fromOffset(84, 16)
+            val.Position = UDim2.new(1, -58, 0, 2)
+            val.BackgroundTransparency = 1
+            val.Font = Enum.Font.GothamBold
+            val.TextSize = 10
+            val.TextColor3 = e.est and Color3.fromRGB(110, 180, 125) or Color3.fromRGB(120, 230, 140)
+            val.TextXAlignment = Enum.TextXAlignment.Right
+            local vs = eggValue(e) > 0 and ((e.est and "~" or "") .. fmtValue(eggValue(e))) or "?"
+            if (e.mult or 0) > 1 then
+                vs = vs .. " x" .. string.format("%.2f", e.mult)
+            end
+            val.Text = vs
+            val.Parent = row
+        end
+        if #sorted > maxRows then
+            local more = Instance.new("TextLabel")
+            more.Size = UDim2.new(1, -14, 0, 14)
+            more.Position = UDim2.fromOffset(6, 0)
+            more.BackgroundTransparency = 1
+            more.Font = Enum.Font.Gotham
+            more.TextSize = 9
+            more.TextColor3 = C_DIM
+            more.LayoutOrder = order * 10 + 9
+            more.Text = "+" .. (#sorted - maxRows) .. " egg lagi"
+            more.Parent = finderList
+        end
     end
 end
 
@@ -894,9 +1436,13 @@ local function syncButtons()
     btnAuto.TextColor3 = FILTER.auto and C_ACCENT or C_DIM
     btnMinVal.Text = "MIN " .. (FILTER.minValue > 0 and fmtValue(FILTER.minValue) or "Any")
     btnRarity.Text = "RARITY " .. (FILTER.rarity == "any" and "Any" or FILTER.rarity)
+    btnMut.Text = "MUT " .. (FILTER.mut == "any" and "Any" or FILTER.mut)
+    btnPlyr.Text = "P<=" .. FILTER.maxPlayers
+    btnReset.Text = FILTER.waitReset and "RESET-WAIT ON" or "RESET-WAIT OFF"
+    btnReset.TextColor3 = FILTER.waitReset and C_ACCENT or C_DIM
 end
 
-local minIdx, rarIdx = 1, 1
+local minIdx, rarIdx, mutIdx, plyIdx = 1, 1, 1, 4
 btnMinVal.MouseButton1Click:Connect(function()
     minIdx = minIdx % #VALUE_STEPS + 1
     FILTER.minValue = VALUE_STEPS[minIdx]
@@ -909,8 +1455,25 @@ btnRarity.MouseButton1Click:Connect(function()
     syncButtons()
     pcall(renderFinder)
 end)
+btnMut.MouseButton1Click:Connect(function()
+    mutIdx = mutIdx % #MUT_STEPS + 1
+    FILTER.mut = MUT_STEPS[mutIdx]
+    syncButtons()
+    pcall(renderFinder)
+end)
+btnPlyr.MouseButton1Click:Connect(function()
+    plyIdx = plyIdx % 6 + 1
+    FILTER.maxPlayers = plyIdx
+    syncButtons()
+    pcall(renderFinder)
+end)
+btnReset.MouseButton1Click:Connect(function()
+    FILTER.waitReset = not FILTER.waitReset
+    syncButtons()
+    notify(FILTER.waitReset and "AUTO menunggu tick reset 5 menit" or "RESET-WAIT off", 3)
+end)
 btnClear.MouseButton1Click:Connect(function()
-    feed.entries = {}
+    feed.servers = {}
     saveFeed()
     pcall(renderFinder)
     notify("Feed dibersihkan", 2)
@@ -977,7 +1540,7 @@ local function makeToggle(parent, text, initial, yPos, onChanged)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- EGG PAGE
+-- EGG PAGE (ESP)
 --─────────────────────────────────────────────────────────────────────────────
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(1, 0, 0, 20)
@@ -1260,7 +1823,7 @@ end
 refreshBtn.MouseButton1Click:Connect(function()
     refreshBtn.Text = "..."
     task.spawn(function()
-        pcall(fetchServers)
+        pcall(fetchServers, false)
         refreshBtn.Text = "REFRESH"
         renderServers()
     end)
@@ -1277,11 +1840,11 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v3"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v5"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
--- STATUS / REFRESH LOOPS
+-- LOOPS
 --─────────────────────────────────────────────────────────────────────────────
 local function statusLoop()
     while state.alive do
@@ -1306,34 +1869,89 @@ local function listLoop()
     end
 end
 
--- perekam feed: scan egg di server sekarang → catat ke feed lokal
+-- filter egg-level untuk feed/AUTO
+local function matchesFilters(e)
+    if FILTER.minValue > 0 and (eggValue(e) or 0) < FILTER.minValue then return false end
+    if FILTER.rarity ~= "any" and lower(e.rarity or "") ~= FILTER.rarity then return false end
+    if FILTER.mut ~= "any" then
+        local hit = false
+        for _, m in ipairs(e.muts or {}) do
+            if lower(m) == FILTER.mut then hit = true break end
+        end
+        if not hit then return false end
+    end
+    return true
+end
+
+-- perekam feed: snapshot egg server ini → feed.servers[jobId] (rebuild = tahan reset 5 menit)
 local function feedLoop()
     while state.alive do
-        task.wait(3)
-        local added = false
-        for inst, data in pairs(state.eggs) do
-            if inst.Parent and data.part and data.part.Parent then
-                local name, value, mult, mut = extractInfo(inst, data.part, data.label)
-                local rar = lower(mut or data.rarity or "common")
-                if (value and value >= 1e6) or rar ~= "common" then
-                    local job = game.JobId
-                    if job and job ~= "" then
-                        local isNew = addFeedEntry({
-                            name   = name or data.name or inst.Name,
-                            rarity = rar,
-                            value  = value or 0,
-                            mult   = mult or 0,
-                            jobId  = job,
-                            ts     = os.time(),
-                        })
-                        if isNew then added = true end
+        task.wait(2)
+        local job = game.JobId
+        if job and job ~= "" then
+            local eggs, changed = {}, false
+            local n = 0
+            for inst, data in pairs(state.eggs) do
+                if inst.Parent and data.part and data.part.Parent then
+                    n = n + 1
+                    local muts = data.muts or {}
+                    local eff = mutEffMult(muts)
+                    local val = data.value
+                    local est = data.est
+                    if not val and data.dbBase then
+                        val = data.dbBase * eff
+                        est = true
                     end
+                    local rar = data.rarity or "common"
+                    local p = data.part.Position
+                    local posKey = math.floor(p.X / 10) .. "_" .. math.floor(p.Y / 10) .. "_" .. math.floor(p.Z / 10)
+                    local key = lower(data.name or inst.Name) .. "|" .. tostring(val) .. "|" ..
+                        tostring(#muts) .. "|" .. rar .. "|" .. posKey
+                    eggs[key] = {
+                        name   = data.name or "?",
+                        rarity = rar,
+                        muts   = muts,
+                        value  = val or 0,
+                        est    = est and true or false,
+                        mult   = data.mult or 0,
+                        dbBase = data.dbBase,
+                        ts     = data.firstSeen or os.time(),
+                    }
                 end
             end
-        end
-        if added then
-            saveFeed()
-            if finderPage.Visible then pcall(renderFinder) end
+
+            local old = feed.servers[job]
+            local here = #Players:GetPlayers()
+            if not old or old.eggCount ~= n or here ~= (old.players or -1) then
+                changed = true
+            end
+
+            local list = {}
+            for _, e in pairs(eggs) do table.insert(list, e) end
+
+            feed.servers[job] = {
+                jobId    = job,
+                ts       = old and old.ts or os.time(),
+                lastSeen = os.time(),
+                players  = here,
+                max      = Players.MaxPlayers,
+                eggs     = list,
+                eggCount = n,
+            }
+
+            -- buang server kadaluarsa
+            local now = os.time()
+            for jid, srv in pairs(feed.servers) do
+                if now - (srv.lastSeen or 0) > CONFIG.feedExpiry then
+                    feed.servers[jid] = nil
+                    changed = true
+                end
+            end
+
+            if changed then
+                saveFeed()
+                if finderPage.Visible then pcall(renderFinder) end
+            end
         end
     end
 end
@@ -1343,29 +1961,42 @@ local function autoLoop()
     while state.alive do
         task.wait(0.5)
         if FILTER.auto and os.clock() - (state.lastHop or 0) >= FILTER.interval then
-            state.lastHop = os.clock()
-            local haveMatch = false
-            for inst, data in pairs(state.eggs) do
-                local _, value, _, mut = extractInfo(inst, data.part, data.label)
-                if matchesFilters({ value = value or 0, rarity = mut or data.rarity }) then
-                    haveMatch = true
-                    break
-                end
-            end
-            if haveMatch then
-                notify("Target lolos filter ada di server ini!", 4)
+            -- RESET-WAIT: hop hanya di jendela ±25s setelah tick reset 5 menit
+            if FILTER.waitReset and (os.time() % CONFIG.resetCycle) > 25 then
+                -- di luar jendela: tunggu, feed terus direfresh oleh feedLoop
             else
-                local target = pickHopTarget()
-                if target then
-                    feed.visited[target] = os.time()
-                    feed.visited[game.JobId] = os.time()
-                    saveFeed()
-                    notify("AUTO: hop ke server baru...", 3)
-                    task.wait(0.2)
-                    joinServer(target)
+                state.lastHop = os.clock()
+                local haveMatch = false
+                for inst, data in pairs(state.eggs) do
+                    if data.part and data.part.Parent then
+                        local eff = mutEffMult(data.muts)
+                        local val = data.value
+                        if not val and data.dbBase then val = data.dbBase * eff end
+                        if matchesFilters({
+                            value = val or 0,
+                            rarity = data.rarity,
+                            muts = data.muts,
+                        }) then
+                            haveMatch = true
+                            break
+                        end
+                    end
+                end
+                if haveMatch then
+                    notify("Target lolos filter ada di server ini!", 4)
                 else
-                    notify("AUTO: tidak ada kandidat server — refresh manual", 4)
-                    pcall(fetchServers)
+                    local target = pickHopTarget()
+                    if target then
+                        feed.visited[target] = os.time()
+                        feed.visited[game.JobId] = os.time()
+                        saveFeed()
+                        notify("AUTO: hop ke server baru...", 3)
+                        task.wait(0.2)
+                        joinServer(target)
+                    else
+                        notify("AUTO: tidak ada kandidat server — refresh manual", 4)
+                        pcall(fetchServers, true)
+                    end
                 end
             end
         end
@@ -1405,28 +2036,37 @@ pcall(renderFinder)
 if PLACE_ID ~= 107778070777162 then
     notify("Bukan place SAE — fitur egg bisa kosong", 5)
 else
-    notify("Loaded. Tab FINDER = daftar egg, AUTO = server-hop.", 4)
+    notify("v5 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
 end
 
 _G.SAE_EGGF = {
-    unload   = unload,
-    config   = CONFIG,
-    state    = state,
-    dump     = function()
+    unload  = unload,
+    config  = CONFIG,
+    state   = state,
+    version = "5.0",
+    dump    = function()
         local out = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
             if (inst:IsA("BasePart") or inst:IsA("Model")) and matchesKeyword(inst.Name) then
-                table.insert(out, inst.ClassName .. " :: " .. inst:GetFullName())
+                local attrs = {}
+                pcall(function()
+                    for k, v in pairs(inst:GetAttributes()) do
+                        table.insert(attrs, k .. "=" .. tostring(v))
+                    end
+                end)
+                table.insert(out, inst.ClassName .. " :: " .. inst:GetFullName() ..
+                    (#attrs > 0 and ("  [" .. table.concat(attrs, ",") .. "]") or ""))
             end
         end
         local txt = table.concat(out, "\n")
-        print("=== SAE DUMP (" .. #out .. " kandidat) ===\n" .. txt)
+        print("=== SAE DUMP v5 (" .. #out .. " kandidat) ===\n" .. txt)
         pcall(function() setclipboard(txt) end)
         notify(#out .. " kandidat di-dump ke console & clipboard", 5)
     end,
 }
 
 task.spawn(scanLoop)
+task.spawn(pendingLoop)
 task.spawn(tpLoop)
 task.spawn(statusLoop)
 task.spawn(listLoop)
@@ -1434,8 +2074,15 @@ task.spawn(feedLoop)
 task.spawn(autoLoop)
 task.spawn(function()
     task.wait(0.5)
-    pcall(fetchServers)
+    pcall(fetchServers, false)
     if state.alive then renderServers() end
+end)
+-- refresh jumlah pemain tiap 30s (x/7 feed tetap segar)
+task.spawn(function()
+    while state.alive do
+        task.wait(30)
+        pcall(fetchServers, false)
+    end
 end)
 -- auto-diagnosa: kalau 6 detik masih 0 egg, buang sampel struktur ke console
 task.spawn(function()
