@@ -5,35 +5,41 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=3"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=5"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
 
-## Fitur
+## Fitur v5
 
-**Tab FINDER** (ala Chilli Finder, keyless)
-- Feed "top recent eggs": nama, badge rarity (golden/rainbow/...), `$value/s`, `xmultiplier`, umur (`3m ago`), tombol `JOIN` per baris
-- Feed lokal yang **persist di disk executor** (`chilli_sae_feed.json`) — riwayat lolos teleport karena tiap hop hanya matikan VM, file tetap ada
-- `AUTO` — server-hopping otomatis (klik: 5s → 10s → 15s → 30s → OFF); berhenti hop kalau egg lolos filter ada di server sekarang
-- `MIN` — filter nilai minimum (Any/1M/100M/1B/10B/100B/1T per detik)
-- `RARITY` — filter mutasi (Any/Golden/Rainbow/Mythic/Secret/Divine)
-- `CLEAR` — bersihkan feed
-- Value & multiplier di-parse dari BillboardGui game; egg dicatat kalau `≥$1M/s` atau bukan common
+**Tab FINDER — feed per-server**
+- Baris per **server**: badge `★TOP` / id, jumlah pemain live `x/7`, total value, umur, tombol `JOIN`
+- Baris egg per server: nama, badge **RARITY** (10 tier ladder resmi: Common → Uncommon → Rare → Epic → Legendary → **Cosmic** → Mythic → Secret → Eternal → Divine), badge **MUTATION** (Silver/Golden/Rainbow/Bloom/Spirit Bloom/Parasite/Fractured), `$value/s` + `xmult` — value estimasi tampil `~$X/s`
+- **2 filter terpisah**: `MUT` (7 mutasi, nama internal Sakura/GreatBloom/Monstrous/Boss ikut dikenali) dan `RARITY` (ladder penuh)
+- `MIN` — nilai minimum (Any/1M/100M/1B/10B/100B/1T per detik); `P<=` — batas pemain per server (default 4); `CLEAR`
+- **★TOP-10 dinamis**: 10 value terbesar lintas feed (base × mutasi); server yang memuatnya boleh **≤6/7** pemain (badge `1 SLOT RACE` saat 6/7) — server biasa ≤`P<=`/7, **7/7 selalu dibuang**
+- Sort: server ★TOP dulu → best value desc → pemain tersedikit; egg per server urut value desc
+- **JOIN pre-check live**: cek jumlah pemain via API sebelum teleport (FULL → skip; melanggar batas → skip)
+- Catatan server lebih tua dari **300 s** (siklus All-Egg Reset) auto-dihapus
+- Feed **persist di disk executor** (`chilli_sae_feed.json`) — lolos teleport
+- **Value fallback**: DB 122 pet (snapshot wiki) — label gagal dibaca → estimasi dari base × multiplier mutasi
+- `AUTO` — server-hop (5/10/15/30 s), stop saat ada egg lolos filter; opsi **RESET-WAIT**: hop hanya di jendela ±25 s setelah tick reset 5 menit
+- Tanpa gambar pet (by design, anti-lag)
 
 **Tab ESP**
-- ESP: nama egg + jarak meter + highlight per rarity
-- Auto-teleport ke egg terdekat (toggle + cooldown 1,5 s)
-- Range maksimum bisa diatur (default 2500 m)
-- List 14 egg terdekat, tombol `TP` per baris
-- Warna rarity: common → godly
+- ESP nama + jarak + highlight per rarity (10 tier, Cosmic ungu / Eternal emas-putih / Divine cyan)
+- Auto-teleport (cooldown 1,5 s), range diatur (default 2500 m), list 14 egg terdekat + `TP`
 
 **Tab SERVERS**
-- Daftar server publik, urut dari yang paling ramai
-- Jumlah pemain `playing/maxPlayers` + ping per server
-- Warna indikator: hijau (sepi) → kuning → merah (penuh)
-- Tombol `JOIN` (TeleportToPlaceInstance, fallback TeleportAsync)
-- Info jumlah pemain di server saat ini
+- Server publik urut populasi, `playing/max` + ping, warna hijau→kuning→merah, `JOIN`
+
+## Engine deteksi (v5)
+
+- **Union per-objek**: nama-egg ∪ atribut ∪ label Billboard digabung — bukan fallback berlapis (telur generik + label tak lagi terlewat)
+- **Pending watchlist 90 s**: telur yang labelnya muncul belakangan di-re-parse terus sampai lengkap (mengatasi reload 5 menit)
+- **Event-driven**: `Workspace.DescendantAdded` → telur baru masuk di frame dia spawn
+- `mode:union` tampil di status bar; 0 egg setelah 6 s → auto-dump 60 sampel ke console (F9)
+- `_G.SAE_EGGF.dump()` → kandidat + **atribut instance** ke console & clipboard
 
 ## Keybind
 
@@ -42,31 +48,8 @@ Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 me
 | `RIGHT SHIFT` | Sembunyikan / tampilkan UI |
 | `END` | Unload total |
 
-## Kalau egg tidak terdeteksi
-
-Deteksi 3 lapis (v2):
-
-1. **strict** — nama mengandung `egg` DAN berada di folder ber-egg atau punya attribute `Rarity`/`Type`/`Tier`
-2. **name** — nama mengandung `egg`, di mana pun
-3. **label** — BillboardGui/TextLabel yang teksnya mengandung `egg` (model bernama generik)
-
-Mode aktif tampil di status bar (`mode:strict` dst). Kalau semua gagal, setelah 6 detik script otomatis buang sampel 60 objek ke console (F9) — kirim ke Asta untuk tuning `CONFIG.keywords`.
-
-## Struktur
-
-| Bagian | Isi |
-|---|---|
-| `CONFIG` | interval scan, range, keyword, cooldown |
-| `FILTER` / `feed` | filter finder + feed lokal (`chilli_sae_feed.json`) |
-| `extractInfo` | parse nama, `$X/s`, `xN`, mutasi dari label game |
-| `RARITY` / `MUT_COLORS` | peta warna rarity & mutasi |
-| `collectEggs` / `refreshESP` | deteksi + render, cap `maxRendered` |
-| `fetchServers` | `games.roblox.com/v1/games/{placeId}/servers/Public` |
-| `pickHopTarget` / `autoLoop` | pemilihan server & hopping otomatis |
-| `joinServer` | teleport ke `jobId` |
-
 ## Catatan
 
-- Server list publik dibatasi ±300 jobId per fetch; jobId bisa expired kalau diklik lama setelah refresh.
-- `TeleportToPlaceInstance` gagal pada server penuh — pakai server yang masih ada slot.
+- Server list publik dibatasi ±300 jobId per fetch; refresh jumlah pemain tiap 30 s.
+- `TeleportToPlaceInstance` gagal pada server penuh — pre-check JOIN menjaga.
 - Tidak ada telemetry, tidak ada API key, tidak ada request ke selain `roblox.com` + `raw.githubusercontent.com`.
