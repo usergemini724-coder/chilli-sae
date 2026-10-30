@@ -1,10 +1,16 @@
 --[[═══════════════════════════════════════════════════════════════════════════
-    SAE — EGG FINDER + SERVER BROWSER  ·  v5
+    SAE — EGG FINDER + SERVER BROWSER  ·  v6
     Game   : Steal An Egg (place 107778070777162)
     Build  : keyless, no password, no HWID, no remote loader
-    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=5"))()
+    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=6"))()
     Tabs   : [FINDER] [ESP] [SERVERS]
     Keys   : RIGHT-SHIFT = toggle UI      END = unload
+
+    v6 changes
+      · UI FINDER diganti total: feed FLAT Chilli-style (1 baris = 1 egg)
+        ikon pengganti gambar = kotak warna rarity + inisial (emas = TOP-10)
+        badge mutasi + value + x-mult + umur + pemain live x/7 per baris
+        JOIN per baris egg, sort TOP dulu lalu value desc
 
     v5 changes
       · deteksi UNION per-objek (strict+name+label digabung, bukan fallback)
@@ -297,7 +303,7 @@ local FILTER = {
     maxPlayers = 4,       -- server biasa ≤4/7; ★TOP ≤6/7; 7/7 selalu buang
     waitReset  = false,   -- hop hanya di jendela setelah tick reset 5 menit
 }
-local joinServer, joinFinderServer, fetchServers, pickHopTarget  -- forward
+local joinServer, joinFinderServer, fetchServers, pickHopTarget, matchesFilters  -- forward
 
 local VALUE_STEPS  = { 0, 1e6, 1e8, 1e9, 1e10, 1e11, 1e12 }
 local RARITY_STEPS = { "any", "common", "uncommon", "rare", "epic", "legendary",
@@ -960,7 +966,7 @@ titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
 titleLabel.TextColor3 = C_TEXT
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = "SAE · EGG FINDER v5"
+titleLabel.Text = "SAE · EGG FINDER v6"
 titleLabel.Parent = titleBar
 
 local closeBtn = Instance.new("TextButton")
@@ -1100,13 +1106,13 @@ local function makeFilterBtn(text, order, parent, cols)
     return b
 end
 
-local btnAuto  = makeFilterBtn("AUTO OFF", 0, btnRow1, 3)
-local btnMinVal= makeFilterBtn("MIN Any", 1, btnRow1, 3)
-local btnRarity= makeFilterBtn("RARITY Any", 2, btnRow1, 3)
-local btnMut   = makeFilterBtn("MUT Any", 0, btnRow2, 4)
-local btnPlyr  = makeFilterBtn("P<=4", 1, btnRow2, 4)
-local btnReset = makeFilterBtn("RESET-WAIT OFF", 2, btnRow2, 4)
-local btnClear = makeFilterBtn("CLEAR", 3, btnRow2, 4)
+local btnAuto  = makeFilterBtn("AUTO OFF", 0, btnRow1, 4)
+local btnMinVal= makeFilterBtn("MIN Any", 1, btnRow1, 4)
+local btnRarity= makeFilterBtn("RARITY Any", 2, btnRow1, 4)
+local btnMut   = makeFilterBtn("MUT Any", 3, btnRow1, 4)
+local btnPlyr  = makeFilterBtn("P<=4", 0, btnRow2, 4)
+local btnReset = makeFilterBtn("RESET-WAIT OFF", 1, btnRow2, 4)
+local btnClear = makeFilterBtn("CLEAR", 2, btnRow2, 4)
 
 local finderSub = Instance.new("TextLabel")
 finderSub.Size = UDim2.new(1, 0, 0, 18)
@@ -1170,13 +1176,14 @@ local function mutText(muts)
     return table.concat(muts, "+")
 end
 
+-- FINDER v6: feed FLAT Chilli-style — 1 baris = 1 egg, tanpa gambar pet
+-- (ikon = kotak warna rarity + inisial; emas = member TOP-10)
 local function renderFinder()
     for _, ch in ipairs(finderList:GetChildren()) do
         if ch:IsA("Frame") or ch:IsA("TextLabel") then ch:Destroy() end
     end
 
     local now = os.time()
-    -- buang server kadaluarsa (>300s = siklus reset)
     for jobId, srv in pairs(feed.servers) do
         if now - (srv.lastSeen or 0) > CONFIG.feedExpiry then
             feed.servers[jobId] = nil
@@ -1187,11 +1194,14 @@ local function renderFinder()
     local topSet = {}
     for _, e in ipairs(topEggs) do topSet[e] = true end
 
-    -- kumpulkan server lolos filter
-    local shown = {}
+    -- kumpulkan baris flat: egg lolos filter + server lolos batas pemain
+    local rows = {}
+    local nEgg, nServer, nTop = 0, 0, 0
     for jobId, srv in pairs(feed.servers) do
-        local isTop = topServers[jobId] == true
-        -- angka pemain live utk server lain dari cache API (refresh 30s)
+        nServer = nServer + 1
+        nEgg = nEgg + #(srv.eggs or {})
+        if topServers[jobId] then nTop = nTop + 1 end
+        local isTopSrv = topServers[jobId] == true
         local live = state.srvById[jobId]
         if live and os.clock() - state.srvAt < 30 then
             srv.players = live.playing
@@ -1199,42 +1209,28 @@ local function renderFinder()
         end
         local players = srv.players or 0
         local cap = srv.max or 7
-        if players < cap then                                  -- 7/7 selalu dibuang
-            if isTop or players <= FILTER.maxPlayers then      -- ★TOP boleh ≤6/7
-                table.insert(shown, { srv = srv, isTop = isTop })
+        if players < cap and (isTopSrv or players <= FILTER.maxPlayers) then
+            for _, e in ipairs(srv.eggs or {}) do
+                if matchesFilters(e) then
+                    table.insert(rows, { e = e, srv = srv, isTop = isTopSrv or topSet[e] == true })
+                end
             end
         end
     end
 
-    -- sort: ★TOP dulu → best value desc → pemain tersedikit → terbaru
-    local function bestVal(srv)
-        local b = 0
-        for _, e in ipairs(srv.eggs or {}) do
-            if eggValue(e) > b then b = eggValue(e) end
-        end
-        return b
-    end
-    table.sort(shown, function(a, b)
-        if a.isTop ~= b.isTop then return a.isTop end
-        local bv, bn = bestVal(a.srv), bestVal(b.srv)
-        if bv ~= bn then return bv > bn end
-        if (a.srv.players or 0) ~= (b.srv.players or 0) then
-            return (a.srv.players or 0) < (b.srv.players or 0)
-        end
-        return (a.srv.lastSeen or 0) > (b.srv.lastSeen or 0)
+    -- sort: member TOP dulu → value desc → terbaru
+    table.sort(rows, function(a, b)
+        local ta, tb = a.isTop and 1 or 0, b.isTop and 1 or 0
+        if ta ~= tb then return ta > tb end
+        if eggValue(a.e) ~= eggValue(b.e) then return eggValue(a.e) > eggValue(b.e) end
+        return (a.e.ts or 0) > (b.e.ts or 0)
     end)
 
-    local nEgg, nServer, nTop = 0, 0, 0
-    for jobId, srv in pairs(feed.servers) do
-        nServer = nServer + 1
-        nEgg = nEgg + #(srv.eggs or {})
-        if topServers[jobId] then nTop = nTop + 1 end
-    end
     local here = #Players:GetPlayers()
-    finderSub.Text = string.format("%d/%d pemain · %d egg · %d server · ★TOP %d · mode:%s",
+    finderSub.Text = string.format("%d/%d pemain · %d egg · %d server · TOP %d · mode:%s",
         here, Players.MaxPlayers, nEgg, nServer, nTop, state.scanMode or "-")
 
-    if #shown == 0 then
+    if #rows == 0 then
         local empty = Instance.new("TextLabel")
         empty.Size = UDim2.new(1, 0, 0, 30)
         empty.BackgroundTransparency = 1
@@ -1246,188 +1242,130 @@ local function renderFinder()
         return
     end
 
-    local order = 0
-    local maxServers = 12
-    for _, item in ipairs(shown) do
-        if order >= maxServers then break end
-        local srv, isTop = item.srv, item.isTop
-        order = order + 1
+    local maxRows = 30
+    for i, item in ipairs(rows) do
+        if i > maxRows then break end
+        local e, srv, isTop = item.e, item.srv, item.isTop
 
-        -- header server
-        local head = Instance.new("Frame")
-        head.Size = UDim2.new(1, -6, 0, 26)
-        head.BackgroundColor3 = isTop and Color3.fromRGB(46, 38, 18) or Color3.fromRGB(24, 24, 29)
-        head.LayoutOrder = order * 10
-        head.Parent = finderList
-        local hc = Instance.new("UICorner")
-        hc.CornerRadius = UDim.new(0, 5)
-        hc.Parent = head
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 36)
+        row.BackgroundColor3 = isTop and Color3.fromRGB(45, 37, 18) or Color3.fromRGB(24, 24, 30)
+        row.LayoutOrder = i
+        row.Parent = finderList
+        local rc = Instance.new("UICorner")
+        rc.CornerRadius = UDim.new(0, 6)
+        rc.Parent = row
 
-        local topBadge = Instance.new("TextLabel")
-        topBadge.Size = UDim2.fromOffset(46, 18)
-        topBadge.Position = UDim2.fromOffset(6, 4)
-        topBadge.BackgroundTransparency = 1
-        topBadge.Font = Enum.Font.GothamBold
-        topBadge.TextSize = 11
-        topBadge.TextColor3 = isTop and C_GOLD or C_DIM
-        topBadge.TextXAlignment = Enum.TextXAlignment.Left
-        topBadge.Text = isTop and "★TOP" or string.sub(srv.jobId or "", 1, 6)
-        topBadge.Parent = head
+        -- ikon pengganti gambar: kotak warna rarity (+ inisial), emas = TOP
+        local ic = Instance.new("Frame")
+        ic.Size = UDim2.fromOffset(24, 24)
+        ic.Position = UDim2.fromOffset(5, 6)
+        ic.BackgroundColor3 = isTop and C_GOLD or rarityColor(e.rarity)
+        ic.Parent = row
+        local icc = Instance.new("UICorner")
+        icc.CornerRadius = UDim.new(0, 6)
+        icc.Parent = ic
+        local icTxt = Instance.new("TextLabel")
+        icTxt.Size = UDim2.fromScale(1, 1)
+        icTxt.BackgroundTransparency = 1
+        icTxt.Font = Enum.Font.GothamBold
+        icTxt.TextSize = 12
+        icTxt.TextColor3 = Color3.fromRGB(20, 20, 24)
+        icTxt.Text = isTop and "*" or string.upper(string.sub(e.name or "?", 1, 1))
+        icTxt.Parent = ic
 
-        local plbl = Instance.new("TextLabel")
-        plbl.Size = UDim2.fromOffset(40, 18)
-        plbl.Position = UDim2.new(1, -212, 0, 4)
-        plbl.BackgroundTransparency = 1
-        plbl.Font = Enum.Font.GothamBold
-        plbl.TextSize = 11
-        local pcol = C_ACCENT
-        if (srv.players or 0) >= 5 then pcol = Color3.fromRGB(255, 190, 90) end
-        if isTop and (srv.players or 0) >= 6 then pcol = Color3.fromRGB(255, 140, 60) end
-        plbl.TextColor3 = pcol
-        plbl.TextXAlignment = Enum.TextXAlignment.Right
-        plbl.Text = string.format("%d/%d", srv.players or 0, srv.max or 7)
-        plbl.Parent = head
+        -- nama pet (baris 1 kiri)
+        local nm = Instance.new("TextLabel")
+        nm.Size = UDim2.fromOffset(130, 14)
+        nm.Position = UDim2.fromOffset(34, 4)
+        nm.BackgroundTransparency = 1
+        nm.Font = Enum.Font.GothamBold
+        nm.TextSize = 11
+        nm.TextColor3 = C_TEXT
+        nm.TextXAlignment = Enum.TextXAlignment.Left
+        nm.TextTruncate = Enum.TextTruncate.AtEnd
+        nm.Text = e.name or "?"
+        nm.Parent = row
 
-        local raceLbl = Instance.new("TextLabel")
-        raceLbl.Size = UDim2.fromOffset(80, 18)
-        raceLbl.Position = UDim2.new(1, -170, 0, 4)
-        raceLbl.BackgroundTransparency = 1
-        raceLbl.Font = Enum.Font.GothamBold
-        raceLbl.TextSize = 10
-        raceLbl.TextColor3 = Color3.fromRGB(255, 140, 60)
-        raceLbl.TextXAlignment = Enum.TextXAlignment.Left
-        raceLbl.Text = (isTop and (srv.players or 0) >= 6) and "1 SLOT RACE" or ""
-        raceLbl.Parent = head
+        -- baris 2 kiri: rarity · pemain x/7 (live) · umur
+        local pcol = "#78E68C"
+        if (srv.players or 0) >= 6 then pcol = "#FF8C3C"
+        elseif (srv.players or 0) >= 5 then pcol = "#FFB85C" end
+        local rarCap = string.upper(string.sub(e.rarity or "common", 1, 1)) ..
+            string.sub(e.rarity or "common", 2)
+        local sub = Instance.new("TextLabel")
+        sub.Size = UDim2.fromOffset(206, 11)
+        sub.Position = UDim2.fromOffset(34, 20)
+        sub.BackgroundTransparency = 1
+        sub.Font = Enum.Font.Gotham
+        sub.TextSize = 9
+        sub.TextColor3 = C_DIM
+        sub.TextXAlignment = Enum.TextXAlignment.Left
+        sub.TextTruncate = Enum.TextTruncate.AtEnd
+        sub.RichText = true
+        sub.Text = string.format("%s%s · <font color=\"%s\">%d/%d</font> · %s",
+            isTop and "*TOP · " or "", rarCap, pcol,
+            srv.players or 0, srv.max or 7, fmtAge(e.ts))
+        sub.Parent = row
 
-        local totLbl = Instance.new("TextLabel")
-        totLbl.Size = UDim2.fromOffset(90, 18)
-        totLbl.Position = UDim2.new(1, -256, 0, 4)
-        totLbl.BackgroundTransparency = 1
-        totLbl.Font = Enum.Font.GothamBold
-        totLbl.TextSize = 10
-        totLbl.TextColor3 = Color3.fromRGB(120, 230, 140)
-        totLbl.TextXAlignment = Enum.TextXAlignment.Right
-        totLbl.Text = fmtValue(bestVal(srv))
-        totLbl.Parent = head
+        -- badge mutasi (zona tengah; muncul hanya kalau ada)
+        local muts = mutText(e.muts)
+        if muts then
+            local pill = Instance.new("TextLabel")
+            pill.Size = UDim2.fromOffset(70, 16)
+            pill.Position = UDim2.new(1, -246, 0, 4)
+            pill.BackgroundColor3 = Color3.fromRGB(38, 38, 46)
+            pill.Font = Enum.Font.GothamBold
+            pill.TextSize = 9
+            pill.TextColor3 = MUT_COLORS[e.muts[1]] or C_DIM
+            pill.TextTruncate = Enum.TextTruncate.AtEnd
+            pill.Text = muts
+            pill.Parent = row
+            local pc = Instance.new("UICorner")
+            pc.CornerRadius = UDim.new(0, 8)
+            pc.Parent = pill
+        end
 
-        local ageLbl = Instance.new("TextLabel")
-        ageLbl.Size = UDim2.fromOffset(44, 18)
-        ageLbl.Position = UDim2.new(1, -266, 0, 4)
-        ageLbl.BackgroundTransparency = 1
-        ageLbl.Font = Enum.Font.Gotham
-        ageLbl.TextSize = 10
-        ageLbl.TextColor3 = C_DIM
-        ageLbl.TextXAlignment = Enum.TextXAlignment.Left
-        ageLbl.Text = fmtAge(srv.lastSeen)
-        ageLbl.Parent = head
+        -- value (kanan, baris 1) + x-mult (baris 2)
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.fromOffset(146, 14)
+        val.Position = UDim2.new(1, -196, 0, 4)
+        val.BackgroundTransparency = 1
+        val.Font = Enum.Font.GothamBold
+        val.TextSize = 11
+        val.TextColor3 = (eggValue(e) <= 0) and C_DIM or
+            (e.est and Color3.fromRGB(110, 180, 125) or Color3.fromRGB(120, 230, 140))
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.Text = eggValue(e) > 0 and ((e.est and "~" or "") .. fmtValue(eggValue(e))) or "$?"
+        val.Parent = row
 
+        local xinfo = Instance.new("TextLabel")
+        xinfo.Size = UDim2.fromOffset(146, 11)
+        xinfo.Position = UDim2.new(1, -196, 0, 20)
+        xinfo.BackgroundTransparency = 1
+        xinfo.Font = Enum.Font.Gotham
+        xinfo.TextSize = 9
+        xinfo.TextColor3 = C_DIM
+        xinfo.TextXAlignment = Enum.TextXAlignment.Right
+        xinfo.Text = (e.mult or 0) > 1 and ("x" .. string.format("%.2f", e.mult)) or ""
+        xinfo.Parent = row
+
+        -- JOIN per baris (server milik egg ini)
         local jb = Instance.new("TextButton")
-        jb.Size = UDim2.fromOffset(52, 18)
-        jb.Position = UDim2.new(1, -56, 0, 4)
+        jb.Size = UDim2.fromOffset(46, 24)
+        jb.Position = UDim2.new(1, -51, 0, 6)
         jb.BackgroundColor3 = isTop and C_GOLD or Color3.fromRGB(255, 150, 40)
         jb.Font = Enum.Font.GothamBold
         jb.TextSize = 11
         jb.TextColor3 = Color3.fromRGB(30, 20, 5)
         jb.Text = "JOIN"
-        jb.Parent = head
+        jb.Parent = row
         local jc = Instance.new("UICorner")
-        jc.CornerRadius = UDim.new(0, 5)
+        jc.CornerRadius = UDim.new(0, 6)
         jc.Parent = jb
         jb.MouseButton1Click:Connect(function()
             joinFinderServer(srv.jobId, isTop)
         end)
-
-        -- baris egg (sort value desc, maks 5 + counter)
-        local eggs = srv.eggs or {}
-        local sorted = {}
-        for _, e in ipairs(eggs) do table.insert(sorted, e) end
-        table.sort(sorted, function(a, b) return eggValue(a) > eggValue(b) end)
-
-        local maxRows = 5
-        for i, e in ipairs(sorted) do
-            if i > maxRows then break end
-            local row = Instance.new("Frame")
-            row.Size = UDim2.new(1, -14, 0, 20)
-            row.Position = UDim2.fromOffset(6, 0)
-            row.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
-            row.LayoutOrder = order * 10 + i
-            row.Parent = finderList
-            local rc = Instance.new("UICorner")
-            rc.CornerRadius = UDim.new(0, 4)
-            rc.Parent = row
-
-            local star = Instance.new("TextLabel")
-            star.Size = UDim2.fromOffset(14, 16)
-            star.Position = UDim2.fromOffset(4, 2)
-            star.BackgroundTransparency = 1
-            star.Font = Enum.Font.GothamBold
-            star.TextSize = 11
-            star.TextColor3 = C_GOLD
-            star.Text = topSet[e] and "★" or ""
-            star.Parent = row
-
-            local nm = Instance.new("TextLabel")
-            nm.Size = UDim2.new(1, -210, 0, 16)
-            nm.Position = UDim2.fromOffset(18, 2)
-            nm.BackgroundTransparency = 1
-            nm.Font = Enum.Font.GothamBold
-            nm.TextSize = 11
-            nm.TextColor3 = C_TEXT
-            nm.TextXAlignment = Enum.TextXAlignment.Left
-            nm.TextTruncate = Enum.TextTruncate.AtEnd
-            nm.Text = e.name or "?"
-            nm.Parent = row
-
-            local rarBadge = Instance.new("TextLabel")
-            rarBadge.Size = UDim2.fromOffset(60, 16)
-            rarBadge.Position = UDim2.new(1, -192, 0, 2)
-            rarBadge.BackgroundTransparency = 1
-            rarBadge.Font = Enum.Font.GothamBold
-            rarBadge.TextSize = 10
-            rarBadge.TextColor3 = rarityColor(e.rarity)
-            rarBadge.TextXAlignment = Enum.TextXAlignment.Left
-            rarBadge.Text = string.upper(string.sub(e.rarity or "common", 1, 3)) ..
-                string.sub(e.rarity or "common", 4)
-            rarBadge.Parent = row
-
-            local mutBadge = Instance.new("TextLabel")
-            mutBadge.Size = UDim2.fromOffset(70, 16)
-            mutBadge.Position = UDim2.new(1, -128, 0, 2)
-            mutBadge.BackgroundTransparency = 1
-            mutBadge.Font = Enum.Font.GothamBold
-            mutBadge.TextSize = 10
-            mutBadge.TextColor3 = (e.muts and #e.muts > 0) and MUT_COLORS[e.muts[1]] or C_DIM
-            mutBadge.TextXAlignment = Enum.TextXAlignment.Left
-            mutBadge.Text = mutText(e.muts) or ""
-            mutBadge.Parent = row
-
-            local val = Instance.new("TextLabel")
-            val.Size = UDim2.fromOffset(84, 16)
-            val.Position = UDim2.new(1, -58, 0, 2)
-            val.BackgroundTransparency = 1
-            val.Font = Enum.Font.GothamBold
-            val.TextSize = 10
-            val.TextColor3 = e.est and Color3.fromRGB(110, 180, 125) or Color3.fromRGB(120, 230, 140)
-            val.TextXAlignment = Enum.TextXAlignment.Right
-            local vs = eggValue(e) > 0 and ((e.est and "~" or "") .. fmtValue(eggValue(e))) or "?"
-            if (e.mult or 0) > 1 then
-                vs = vs .. " x" .. string.format("%.2f", e.mult)
-            end
-            val.Text = vs
-            val.Parent = row
-        end
-        if #sorted > maxRows then
-            local more = Instance.new("TextLabel")
-            more.Size = UDim2.new(1, -14, 0, 14)
-            more.Position = UDim2.fromOffset(6, 0)
-            more.BackgroundTransparency = 1
-            more.Font = Enum.Font.Gotham
-            more.TextSize = 9
-            more.TextColor3 = C_DIM
-            more.LayoutOrder = order * 10 + 9
-            more.Text = "+" .. (#sorted - maxRows) .. " egg lagi"
-            more.Parent = finderList
-        end
     end
 end
 
@@ -1840,7 +1778,7 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v5"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v6"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -1870,7 +1808,7 @@ local function listLoop()
 end
 
 -- filter egg-level untuk feed/AUTO
-local function matchesFilters(e)
+function matchesFilters(e)
     if FILTER.minValue > 0 and (eggValue(e) or 0) < FILTER.minValue then return false end
     if FILTER.rarity ~= "any" and lower(e.rarity or "") ~= FILTER.rarity then return false end
     if FILTER.mut ~= "any" then
@@ -2036,14 +1974,14 @@ pcall(renderFinder)
 if PLACE_ID ~= 107778070777162 then
     notify("Bukan place SAE — fitur egg bisa kosong", 5)
 else
-    notify("v5 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
+    notify("v6 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
 end
 
 _G.SAE_EGGF = {
     unload  = unload,
     config  = CONFIG,
     state   = state,
-    version = "5.0",
+    version = "6.0",
     dump    = function()
         local out = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
