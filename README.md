@@ -5,10 +5,17 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=9"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=10"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
+
+## v8.2 — CHILLI LIVE (RE hasil 2026-10-30)
+
+- **Ditemukan**: endpoint publik Chilli `https://chillihub.pro/api/public/stats` — **tanpa Sign In/key** (HTTP 200 via curl biasa). Ini sumber yang SAMA dipakai UI Chilli gratis ("Top recent eggs")
+- **CHILLI LIVE rows** di atas FINDER list: max 5 egg teratas lintas-server (nama + mutasi + area + umur + value), badge `CHILLI` hijau, tombol `LIVE` (feed publik tanpa jobId → tidak bisa auto-join; kejar via AUTOJOIN/hop)
+- Refresh 60s; fetch gagal = diam (tanpa spam)
+- Fakta RE: jobId & feed lengkap 412 egg = fitur berbayar Chilli (auth server-side, tidak bisa dibajak gratis)
 
 ## v8.1 — solo-swarm tuning (anti-macet jam ramai)
 

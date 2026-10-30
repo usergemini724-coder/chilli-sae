@@ -230,6 +230,11 @@ local CAP_STEPS    = { 4, 2, 6, 0 }   -- 0 = Any (non-full saja)
 local FEED_FILE = "chilli_sae_feed.json"
 local feed = { servers = {}, visited = {} }
 
+-- CHILLI LIVE: endpoint publik yang sama dipakai UI Chilli gratis
+-- (tanpa Sign In, tanpa key — terkonfirmasi HTTP 200; TANPA jobId = info saja)
+local CHILLI_STATS = "https://chillihub.pro/api/public/stats"
+local chilli = { eggs = {}, at = 0, ok = false }
+
 --─────────────────────────────────────────────────────────────────────────────
 -- HELPERS
 --─────────────────────────────────────────────────────────────────────────────
@@ -733,6 +738,41 @@ local function httpGet(url)
     ok = pcall(function() body = request({ Url = url, Method = "GET" }).Body end)
     if ok and type(body) == "string" and #body > 0 then return body end
     return nil
+end
+
+-- fetch feed publik Chilli (top recent eggs lintas-server, tanpa jobId)
+-- ditemukan via RE 2026-10-30: endpoint yang sama dipakai UI Chilli gratis
+local function fetchChilli()
+    local raw = httpGet(CHILLI_STATS)
+    if not raw then chilli.ok = false return end
+    local ok, dec = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok or type(dec) ~= "table" or type(dec.top) ~= "table" then
+        chilli.ok = false
+        return
+    end
+    local out = {}
+    for _, e in ipairs(dec.top) do
+        local tier = tonumber(e.rarity) or 1
+        local rar = RARITY_ORDER[math.max(1, math.min(#RARITY_ORDER, tier))]
+        local muts = {}
+        if type(e.mutation) == "string" and #e.mutation > 0 then
+            for part in string.gmatch(e.mutation, "[^,]+") do
+                local p = string.match(part, "^%s*(.-)%s*$")
+                if p and #p > 0 then table.insert(muts, p) end
+            end
+        end
+        table.insert(out, {
+            name = e.name or "?",
+            rarity = rar,
+            valueText = e.valueText,
+            area = e.area,
+            muts = muts,
+            at = (tonumber(e.at) or 0) / 1000,   -- ms → s
+        })
+    end
+    chilli.eggs = out
+    chilli.at = os.time()
+    chilli.ok = true
 end
 
 function fetchServers(excludeFull)
@@ -1316,7 +1356,93 @@ function renderFinder()
     finderSub.Text = string.format("%d/%d pemain · %d egg · %d server · TOP %d · mode:%s",
         here, Players.MaxPlayers, nEgg, nServer, nTop, state.scanMode or "-")
 
-    if #rows == 0 then
+    -- CHILLI LIVE rows (lintas-server real, tanpa jobId → info + target manual)
+    local chilliRows = 0
+    for ci, e in ipairs(chilli.eggs) do
+        if ci > 5 then break end
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 38)
+        row.BackgroundColor3 = Color3.fromRGB(16, 34, 26)
+        row.LayoutOrder = -100 + ci
+        row.Parent = finderList
+        local rc = Instance.new("UICorner")
+        rc.CornerRadius = UDim.new(0, 7)
+        rc.Parent = row
+        local rs = Instance.new("UIStroke")
+        rs.Color = C_ACCENT
+        rs.Thickness = 1
+        rs.Transparency = 0.5
+        rs.Parent = row
+
+        local tag = Instance.new("TextLabel")
+        tag.Size = UDim2.fromOffset(58, 16)
+        tag.Position = UDim2.fromOffset(6, 4)
+        tag.BackgroundColor3 = C_ACCENT
+        tag.Font = Enum.Font.GothamBold
+        tag.TextSize = 9
+        tag.TextColor3 = Color3.fromRGB(10, 26, 17)
+        tag.Text = "CHILLI"
+        tag.Parent = row
+        local tagC = Instance.new("UICorner")
+        tagC.CornerRadius = UDim.new(0, 4)
+        tagC.Parent = tag
+
+        local nm = Instance.new("TextLabel")
+        nm.Size = UDim2.new(1, -180, 0, 14)
+        nm.Position = UDim2.fromOffset(70, 4)
+        nm.BackgroundTransparency = 1
+        nm.Font = Enum.Font.GothamBold
+        nm.TextSize = 11
+        nm.TextColor3 = C_TEXT
+        nm.TextXAlignment = Enum.TextXAlignment.Left
+        nm.TextTruncate = Enum.TextTruncate.AtEnd
+        nm.Text = e.name .. (#e.muts > 0 and " (" .. table.concat(e.muts, "+") .. ")" or "")
+        nm.Parent = row
+
+        local meta = Instance.new("TextLabel")
+        meta.Size = UDim2.new(1, -180, 0, 11)
+        meta.Position = UDim2.fromOffset(70, 21)
+        meta.BackgroundTransparency = 1
+        meta.Font = Enum.Font.Gotham
+        meta.TextSize = 9
+        meta.TextColor3 = C_DIM
+        meta.TextXAlignment = Enum.TextXAlignment.Left
+        meta.TextTruncate = Enum.TextTruncate.AtEnd
+        meta.Text = string.format("%s · %s ago", e.area or "?", fmtAge(math.floor(e.at)))
+        meta.Parent = row
+
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.fromOffset(110, 28)
+        val.Position = UDim2.new(1, -166, 0, 5)
+        val.BackgroundTransparency = 1
+        val.Font = Enum.Font.GothamBold
+        val.TextSize = 11
+        val.TextColor3 = Color3.fromRGB(120, 230, 140)
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.Text = e.valueText or "-"
+        val.Parent = row
+
+        local ib = Instance.new("TextButton")
+        ib.Size = UDim2.fromOffset(46, 26)
+        ib.Position = UDim2.new(1, -52, 0, 6)
+        ib.BackgroundColor3 = C_PANEL2
+        ib.Font = Enum.Font.GothamBold
+        ib.TextSize = 10
+        ib.TextColor3 = C_ACCENT
+        ib.Text = "LIVE"
+        ib.AutoButtonColor = false
+        ib.Parent = row
+        local ic2 = Instance.new("UICorner")
+        ic2.CornerRadius = UDim.new(0, 6)
+        ic2.Parent = ib
+        hoverify(ib, C_PANEL2, Color3.fromRGB(44, 60, 50))
+        ib.MouseButton1Click:Connect(function()
+            notify("Feed publik Chilli (tanpa jobId) — kejar pakai AUTOJOIN/hop", 4)
+        end)
+        chilliRows = chilliRows + 1
+    end
+
+    if #rows == 0 and chilliRows == 0 then
         local empty = Instance.new("TextLabel")
         empty.Size = UDim2.new(1, 0, 0, 30)
         empty.BackgroundTransparency = 1
@@ -2163,6 +2289,14 @@ task.spawn(function()
     while state.alive do
         task.wait(30)
         pcall(fetchServers, false)
+    end
+end)
+task.spawn(function()
+    task.wait(1)
+    while state.alive do
+        pcall(fetchChilli)
+        if state.alive and finderPage.Visible then pcall(renderFinder) end
+        task.wait(60)
     end
 end)
 task.spawn(function()
