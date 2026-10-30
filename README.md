@@ -5,10 +5,27 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=6"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=8"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
+
+## v8 — full rebuild (clean dark minimal)
+
+- **UI baru**: panel flat gelap 1 aksen hijau, tab pill FINDER/SERVERS/SETTINGS, hover state semua tombol, **toast slide-in** (kanan atas), **toggle knob animasi**, occupancy **BAR** di server list, status dot di topbar (hijau = egg terdeteksi)
+- **SEARCH BOX** di FINDER — filter nama pet realtime (min. 2 huruf)
+- **CAP filter** (ganti `P<=`): ≤4 / ≤2 / ≤6 / Any — batas pemain untuk JOIN & AUTO hop; **7/7 FULL selalu dibuang** di semua mode ("server tidak full" by design)
+- **MIN default = Any** (penyebab feed kosong lama: default MIN $1.00B terlalu ketat)
+- Close `×` / minimize `–` = sembunyikan (aman); unload beneran = `END` atau SETTINGS→UNLOAD
+- Otak **v7 dipertahankan utuh**: parser per-depth scoping + sanity clamp 12× + PET_DB 122 + union detection + pending 90s + feed persist + TOP-10 dinamis (★ emas, JOIN ≤6/7 = RACE) + RESET-WAIT
+- Tanpa auto-steal / auto-race / anti-hit — **pure finder + join**
+
+## Akurasi nilai (warisan v7)
+
+- **Label di-scope per kedalaman folder** — `value`/`rarity`/`mutasi` hanya dibaca dari cakupan setempat nama pet ditemukan; label telur tetangga di folder induk tidak lagi tercatat sebagai nilai telur ini
+- **Sanity clamp** — value live > 12× base DB (stack mutasi penuh pun maks ±9×, aditif) = hampir pasti label asing → dibuang, fallback ke estimasi DB (`~$X/s`)
+- `parseMoney` mendukung angka ber-koma (`$1,234.5B/s`) dan suffix huruf kecil
+- Tangga MIN terverifikasi: Any → $1M → $100M → $1B → $10B → **$100B** → $1T (skala benar: 1e11)
 
 ## Fitur v6
 
