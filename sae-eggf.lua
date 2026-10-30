@@ -208,14 +208,15 @@ local state = {
 -- FILTER.minValue default 0 = Any (feed cepat terisi; MIN tinggi = kosong)
 -- FILTER.capFilter: 4/2/6 = batas pemain, 0 = Any (yang penting bukan 7/7)
 local FILTER = {
-    auto       = false,
-    interval   = 5,
-    minValue   = 0,
-    rarity     = "any",
-    mut        = "any",
-    capFilter  = 4,
-    waitReset  = false,
-    search     = "",
+    auto        = false,
+    interval    = 5,
+    minValue    = 0,
+    rarity      = "any",
+    mut         = "any",
+    capFilter   = 4,
+    waitReset   = false,
+    autoJoinFeed = true,   -- AUTO: join otomatis saat feed lintas-server match
+    search      = "",
 }
 local joinServer, joinFinderServer, fetchServers, pickHopTarget, matchesFilters  -- forward
 
@@ -832,29 +833,31 @@ function joinFinderServer(jobId, isTop)
     joinServer(jobId)
 end
 
--- AUTO hop: hanya server tidak-full + hormati CAP filter, prefer paling sepi
+-- AUTO hop: hormati CAP filter, TAPI fallback longgar saat jam ramai
+-- (dulu: excludeFull + visited 480s + CAP ketat = "tidak ada kandidat" terus)
+-- return: jobId, isLoose (true = CAP dilonggarkan otomatis)
 function pickHopTarget()
     if #state.servers == 0 or os.clock() - state.srvAt > 60 then
-        pcall(fetchServers, true)
+        pcall(fetchServers, false)
     end
     local now = os.time()
-    local cands = {}
+    local strict, loose = {}, {}
     for _, s in ipairs(state.servers) do
         if s.id ~= game.JobId and s.playing > 0 and s.max > 0 and s.playing < s.max then
-            if FILTER.capFilter == 0 or s.playing <= FILTER.capFilter then
-                table.insert(cands, s)
+            local last = feed.visited[s.id]
+            if (not last) or (now - last > 180) then
+                table.insert(loose, s)
+                if FILTER.capFilter == 0 or s.playing <= FILTER.capFilter then
+                    table.insert(strict, s)
+                end
             end
         end
     end
-    table.sort(cands, function(a, b) return a.playing < b.playing end)
-
-    local fallback
-    for _, s in ipairs(cands) do
-        local last = feed.visited[s.id]
-        if not last or now - last > 480 then return s.id end
-        if not fallback then fallback = s.id end
-    end
-    return fallback
+    table.sort(strict, function(a, b) return a.playing < b.playing end)
+    table.sort(loose,  function(a, b) return a.playing < b.playing end)
+    if #strict > 0 then return strict[1].id, false end
+    if #loose  > 0 then return loose[1].id,  true  end
+    return nil
 end
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -1163,6 +1166,7 @@ local btnMut    = makeChip("MUT Any", 3, chipRow1, 4)
 local btnCap    = makeChip("CAP ≤4", 0, chipRow2, 4)
 local btnReset  = makeChip("RESET-WAIT OFF", 1, chipRow2, 4)
 local btnClear  = makeChip("CLEAR", 2, chipRow2, 4)
+local btnJoinF  = makeChip("AUTOJOIN ON", 3, chipRow2, 4)
 
 local searchBox = Instance.new("TextBox")
 searchBox.Size = UDim2.new(1, 0, 0, 22)
@@ -1462,6 +1466,8 @@ local function syncButtons()
     btnCap.Text = FILTER.capFilter == 0 and "CAP Any" or ("CAP ≤" .. FILTER.capFilter)
     btnReset.Text = FILTER.waitReset and "RESET-WAIT ON" or "RESET-WAIT OFF"
     btnReset.TextColor3 = FILTER.waitReset and C_ACCENT or C_DIM
+    btnJoinF.Text = FILTER.autoJoinFeed and "AUTOJOIN ON" or "AUTOJOIN OFF"
+    btnJoinF.TextColor3 = FILTER.autoJoinFeed and C_ACCENT or C_DIM
 end
 
 local minIdx, rarIdx, mutIdx, capIdx = 1, 1, 1, 1
@@ -1500,10 +1506,16 @@ btnClear.MouseButton1Click:Connect(function()
     pcall(renderFinder)
     notify("Feed dibersihkan", 2)
 end)
+btnJoinF.MouseButton1Click:Connect(function()
+    FILTER.autoJoinFeed = not FILTER.autoJoinFeed
+    syncButtons()
+    notify(FILTER.autoJoinFeed and "AUTOJOIN: feed lintas-server auto-join" or "AUTOJOIN: hanya scan, join manual", 3)
+end)
 btnAuto.MouseButton1Click:Connect(function()
     if not FILTER.auto then
         FILTER.auto = true
-        FILTER.interval = 5
+        FILTER.interval = 3
+    elseif FILTER.interval == 3 then FILTER.interval = 5
     elseif FILTER.interval == 5 then FILTER.interval = 10
     elseif FILTER.interval == 10 then FILTER.interval = 15
     elseif FILTER.interval == 15 then FILTER.interval = 30
@@ -2018,17 +2030,48 @@ local function autoLoop()
                 if haveMatch then
                     notify("Target lolos filter ada di server ini!", 4, C_GOLD)
                 else
-                    local target = pickHopTarget()
-                    if target then
-                        feed.visited[target] = os.time()
-                        feed.visited[game.JobId] = os.time()
-                        saveFeed()
-                        notify("AUTO: hop ke server baru...", 3)
+                    -- SOLO-SWARM: cari egg yang lolos filter di feed lintas-server
+                    local joinJob, joinTop, joinVal
+                    if FILTER.autoJoinFeed then
+                        local topEggs, topServers = computeTop()
+                        for jobId, srv in pairs(feed.servers) do
+                            if jobId ~= game.JobId then
+                                local isTop = topServers[jobId] == true
+                                local players = srv.players or 0
+                                local cap = srv.max or 7
+                                if serverCapOk(players, cap, isTop) then
+                                    for _, e in ipairs(srv.eggs or {}) do
+                                        if (e.value or 0) > 0 and matchesFilters(e) then
+                                            if not joinVal or e.value > joinVal then
+                                                joinVal, joinJob, joinTop = e.value, jobId, isTop
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if joinJob then
+                        state.lastHop = os.clock()
+                        notify("FEED MATCH: " .. fmtValue(joinVal) ..
+                            (joinTop and " ★TOP" or "") .. " di server lain — JOIN!", 4, C_GOLD)
                         task.wait(0.2)
-                        joinServer(target)
+                        joinFinderServer(joinJob, joinTop)
                     else
-                        notify("AUTO: tidak ada kandidat server — refresh manual", 4)
-                        pcall(fetchServers, true)
+                        local target, loose = pickHopTarget()
+                        if target then
+                            feed.visited[target] = os.time()
+                            feed.visited[game.JobId] = os.time()
+                            saveFeed()
+                            notify(loose
+                                and "AUTO: jam ramai — CAP dilonggarkan sementara"
+                                or "AUTO: hop ke server baru...", 3)
+                            task.wait(0.2)
+                            joinServer(target)
+                        else
+                            notify("AUTO: 0 server non-full — tunggu slot / refresh", 4)
+                            pcall(fetchServers, false)
+                        end
                     end
                 end
             end

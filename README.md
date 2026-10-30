@@ -5,10 +5,17 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=8"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=9"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
+
+## v8.1 — solo-swarm tuning (anti-macet jam ramai)
+
+- `AUTO` cycle: **3s / 5s / 10s / 15s / 30s / OFF**
+- **AUTOJOIN chip baru**: saat AUTO ON, feed lintas-server yang lolos filter di-**join otomatis** (ambil value terbesar; ★TOP tetap boleh ≤6/7)
+- **AUTO hop anti-macet**: fetch semua server publik (filter lokal) · visited 480s→**180s** · kalau CAP ketat bikin 0 kandidat saat jam ramai → **fallback longgar otomatis** (server non-full paling sepi, CAP diabaikan + notify)
+- Toast "tidak ada kandidat" hanya muncul kalau benar-benar 0 server non-full di seluruh list
 
 ## v8 — full rebuild (clean dark minimal)
 
