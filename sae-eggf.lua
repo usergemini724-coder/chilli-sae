@@ -1,45 +1,35 @@
 --[[═══════════════════════════════════════════════════════════════════════════
-    SAE — EGG FINDER + SERVER BROWSER  ·  v7
-    Game   : Steal An Egg (place 107778070777162)
-    Build  : keyless, no password, no HWID, no remote loader
-    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=7"))()
-    Tabs   : [FINDER] [ESP] [SERVERS]
-    Keys   : RIGHT-SHIFT = toggle UI      END = unload
+    SAE FINDER v8  ·  CLEAN DARK MINIMAL  ·  FULL REBUILD
+    Game  : Steal An Egg (place 107778070777162, max 7)
+    Load  : loadstring(game:HttpGet(".../sae-eggf.lua?v=8"))()
+    Keys  : RIGHT-SHIFT = toggle UI      END = unload
+    Tabs  : [FINDER] [SERVERS] [SETTINGS]
 
-    v7 changes (ACCURACY FIX)
-      · label di-scope per kedalaman folder: value/rarity/mutasi hanya dibaca
-        dari cakupan setempat nama pet ditemukan → label telur tetangga di
-        folder induk tidak lagi tercatat sebagai nilai telur ini
-      · sanity clamp: value live > 12x base DB = label asing → dibuang,
-        fallback ke estimasi DB (biang "MIN 100B tapi isi <2B")
-      · parseMoney: dukung angka ber-koma & suffix huruf kecil
-      · chip MIN tampil "$100B" tanpa "/s" biar ringkas
-
-    v6 changes
-      · UI FINDER diganti total: feed FLAT Chilli-style (1 baris = 1 egg)
-        ikon pengganti gambar = kotak warna rarity + inisial (emas = TOP-10)
-        badge mutasi + value + x-mult + umur + pemain live x/7 per baris
-        JOIN per baris egg, sort TOP dulu lalu value desc
-
-    v5 changes
-      · deteksi UNION per-objek (strict+name+label digabung, bukan fallback)
-      · pending-watchlist 90s: telur yang datanya telat di-re-parse terus
-      · event-driven: DescendantAdded → telur baru masuk di frame dia spawn
-      · filter MUTATION & RARITY terpisah (7 mutasi, ladder 10 tier resmi:
-        Common<Uncommon<Rare<Epic<Legendary<Cosmic<Mythic<Secret<Eternal<Divine)
-      · value fallback dari DB 122 pet (wiki snapshot) → tampil "~$X/s"
-      · feed per-server: x/7 pemain, ≤4/7 default, server ★TOP-10 boleh ≤6/7
-        (7/7 selalu dibuang), 6/7 ditandai "1 SLOT RACE"
-      · sort value desc (terberat dulu), tiebreak pemain tersedikit
-      · JOIN pre-check jumlah pemain live (API servers/Public)
-      · catatan server >300s (siklus reset All-Egg) auto-dihapus
-      · opsi WAIT RESET: AUTO hop hanya di jendela ±25s setelah tick reset 5 menit
-      · tanpa gambar pet (anti-lag, by design)
+    v8 = replace total. Misi: meniru Chilli Finder, keyless.
+      · UI baru: clean dark minimal — flat panel, 1 aksen, hover, toast slide,
+        toggle knob animasi, tab pill, occupancy BAR di server list
+      · FINDER: feed flat Chilli-style (1 baris = 1 egg) + SEARCH BOX baru
+      · Filter chips: AUTO · MIN (default Any) · RARITY · MUT · CAP · RESET · CLEAR
+        CAP = batas pemain server utk JOIN/AUTO hop (≤2/≤4/≤6/Any-non-full),
+        7/7 FULL selalu dibuang di semua mode → "server tidak full" by design
+      · Otak akurasi v7 dipertahankan utuh:
+        - extractInfo per-depth scoping (label telur tetangga tidak menular)
+        - sanity clamp 12x DB base
+        - parseMoney koma + suffix lowercase
+        - PET_DB 122 pet (wiki snapshot) sebagai fallback value
+        - union detection (strict ∪ name ∪ billboard-label) + pending 90s
+      · Feed persist di disk executor → tahan teleport/reinject
+      · TOP-10 dinamis lintas server = highlight emas (JOIN ≤6/7 = RACE)
+      · RESET-WAIT: AUTO hop hanya di jendela ±25s setelah tick reset 300s
+      · ZERO telemetry: hanya roblox.com + raw.githubusercontent.com
+      · TANPA auto-steal / auto-race / anti-hit — pure finder + join
 ═══════════════════════════════════════════════════════════════════════════]]
 
-if _G.SAE_EGGF then
+-- unload build lama (v7 maupun v8 sebelumnya)
+if _G.SAE_FINDER or _G.SAE_EGGF then
     task.spawn(function()
-        pcall(function() _G.SAE_EGGF.unload() end)
+        pcall(function() if _G.SAE_FINDER then _G.SAE_FINDER.unload() end end)
+        pcall(function() if _G.SAE_EGGF then _G.SAE_EGGF.unload() end end)
     end)
     task.wait(0.2)
 end
@@ -48,7 +38,6 @@ local Players           = game:GetService("Players")
 local Workspace         = game:GetService("Workspace")
 local TeleportService   = game:GetService("TeleportService")
 local HttpService       = game:GetService("HttpService")
-local RunService        = game:GetService("RunService")
 local StarterGui        = game:GetService("StarterGui")
 local UserInputService  = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
@@ -69,11 +58,10 @@ local CONFIG = {
     tpCooldown    = 1.5,
     maxRendered   = 120,
     resetCycle    = 300,   -- All-Egg Reset ±300s (terverifikasi)
-    pendingWindow = 90,    -- telur tanpa data dikejar 90 detik
-    feedExpiry    = 300,   -- catatan server lebih tua = hapus
+    pendingWindow = 90,
+    feedExpiry    = 300,
 }
 
--- ladder rarity resmi (Cosmic DI TENGAH — khas SAE)
 local RARITY_ORDER = { "common", "uncommon", "rare", "epic", "legendary",
                        "cosmic", "mythic", "secret", "eternal", "divine" }
 local RARITY = {
@@ -90,10 +78,7 @@ local RARITY = {
 }
 
 --─────────────────────────────────────────────────────────────────────────────
-
---─────────────────────────────────────────────────────────────────────────────
--- MUTASI (7) — display name, nama internal config, multiplier
--- stacking ADDITIF: eff = 1 + Σ(scalar − 1)
+-- MUTASI (7) — stacking ADDITIF: eff = 1 + Σ(scalar − 1)
 --─────────────────────────────────────────────────────────────────────────────
 local MUT_MULT = {
     ["Silver"]       = 1.2,
@@ -113,7 +98,6 @@ local MUT_COLORS = {
     ["Parasite"]     = Color3.fromRGB(150, 255,  90),
     ["Fractured"]    = Color3.fromRGB(255, 120,  70),
 }
--- token teks → nama kanonik (urutan panjang dulu biar "spirit bloom" tak kepacak "bloom")
 local MUT_TOKENS = {
     { tok = "spirit bloom", can = "Spirit Bloom" },
     { tok = "greatbloom",   can = "Spirit Bloom" },
@@ -125,7 +109,7 @@ local MUT_TOKENS = {
     { tok = "fractured",    can = "Fractured"    },
     { tok = "sakura",       can = "Bloom"        },
     { tok = "bloom",        can = "Bloom"        },
-    { tok = "boss",         can = "Fractured"    }, -- diproses SETELAH nama pet dibuang
+    { tok = "boss",         can = "Fractured"    },
 }
 
 local function mutEffMult(muts)
@@ -138,8 +122,7 @@ local function mutEffMult(muts)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- PET DB (fallback value) — snapshot wiki 2026-09-28, 106 slot + 16 lead
--- [nama-lowercase] = { income_per_detik, "Rarity" }
+-- PET DB (fallback value) — snapshot wiki 2026-09-28, 122 slot
 --─────────────────────────────────────────────────────────────────────────────
 local PET_DB = {
     ["chicken"]={1,"Common"},["dog"]={2,"Common"},["bird"]={8,"Uncommon"},
@@ -204,31 +187,55 @@ local PET_DB = {
 }
 
 --─────────────────────────────────────────────────────────────────────────────
--- STATE
+-- STATE + FILTER
 --─────────────────────────────────────────────────────────────────────────────
 local state = {
-    eggs       = {},          -- [Instance] = { part, rarity, name, value, mult, muts, est, firstSeen, pending, since }
+    eggs       = {},
     espCache   = {},
     rendered   = 0,
     autoTPOn   = false,
     lastTP     = 0,
     lastHop    = 0,
-    servers    = {},          -- server browser: { {id, playing, max, ping} }
-    srvById    = {},          -- [jobId] = server ref (untuk pre-check JOIN)
-    srvAt      = 0,           -- waktu fetch terakhir
+    servers    = {},
+    srvById    = {},
+    srvAt      = 0,
     currentJob = nil,
     fetching   = false,
     scanMode   = "-",
     alive      = true,
 }
 
+-- FILTER.minValue default 0 = Any (feed cepat terisi; MIN tinggi = kosong)
+-- FILTER.capFilter: 4/2/6 = batas pemain, 0 = Any (yang penting bukan 7/7)
+local FILTER = {
+    auto       = false,
+    interval   = 5,
+    minValue   = 0,
+    rarity     = "any",
+    mut        = "any",
+    capFilter  = 4,
+    waitReset  = false,
+    search     = "",
+}
+local joinServer, joinFinderServer, fetchServers, pickHopTarget, matchesFilters  -- forward
+
+local VALUE_STEPS  = { 0, 1e6, 1e8, 1e9, 1e10, 1e11, 1e12 }
+local RARITY_STEPS = { "any", "common", "uncommon", "rare", "epic", "legendary",
+                       "cosmic", "mythic", "secret", "eternal", "divine" }
+local MUT_STEPS    = { "any", "silver", "golden", "rainbow", "bloom",
+                       "spirit bloom", "parasite", "fractured" }
+local CAP_STEPS    = { 4, 2, 6, 0 }   -- 0 = Any (non-full saja)
+
+local FEED_FILE = "chilli_sae_feed.json"
+local feed = { servers = {}, visited = {} }
+
 --─────────────────────────────────────────────────────────────────────────────
 -- HELPERS
 --─────────────────────────────────────────────────────────────────────────────
-local function notify(txt, dur)
+local notify = function(txt, dur)
     pcall(function()
         StarterGui:SetCore("SendNotification", {
-            Title = "SAE Egg Finder",
+            Title = "SAE Finder",
             Text = tostring(txt),
             Duration = dur or 3,
         })
@@ -301,28 +308,8 @@ local function distTo(part)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- FORMAT
+-- FORMAT + FEED STORE
 --─────────────────────────────────────────────────────────────────────────────
-local FILTER = {
-    auto       = false,
-    interval   = 5,
-    minValue   = 0,
-    rarity     = "any",   -- ladder lower
-    mut        = "any",   -- display lower ("spirit bloom" dll)
-    maxPlayers = 4,       -- server biasa ≤4/7; ★TOP ≤6/7; 7/7 selalu buang
-    waitReset  = false,   -- hop hanya di jendela setelah tick reset 5 menit
-}
-local joinServer, joinFinderServer, fetchServers, pickHopTarget, matchesFilters  -- forward
-
-local VALUE_STEPS  = { 0, 1e6, 1e8, 1e9, 1e10, 1e11, 1e12 }
-local RARITY_STEPS = { "any", "common", "uncommon", "rare", "epic", "legendary",
-                       "cosmic", "mythic", "secret", "eternal", "divine" }
-local MUT_STEPS    = { "any", "silver", "golden", "rainbow", "bloom",
-                       "spirit bloom", "parasite", "fractured" }
-
-local FEED_FILE = "chilli_sae_feed.json"
-local feed = { servers = {}, visited = {} }   -- servers[jobId] = { jobId, ts, lastSeen, players, max, eggs={...} }
-
 local function fmtValue(n)
     if not n or n <= 0 then return "-" end
     local units = { { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
@@ -362,9 +349,7 @@ local function saveFeed()
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- PARSER LABEL → (nama, value, mult, muts, rarity)
--- urutan: cocokkan nama pet dulu (buang dari teks) → baru token mutasi,
--- supaya "Cosmic Skeleton Boss" tidak salah terbaca mutasi Fractured.
+-- PARSER v7 (dipertahankan utuh — jangan diutak-atik tanpa kalibrasi)
 --─────────────────────────────────────────────────────────────────────────────
 local function parseMoney(text)
     local num, suf = string.match(text, "%$([%d%,%.]+)%s*(%a?)%s*/s")
@@ -392,14 +377,10 @@ local function blankOut(s, pattern)
 end
 
 local function extractInfo(inst, part, fallbackLabel)
-    -- v7 ACCURACY: teks dikumpulkan PER LEVEL kedalaman.
-    --   lvl 0 = di dalam model telur sendiri (billboard/label miliknya)
-    --   lvl 1..3 = naik ke folder induk → RAWAN campur label telur tetangga
-    -- Urutan insert = level terdalam dulu, jadi scan berurutan = paling dipercaya.
-    -- Semua sinyal (value/mult/rarity/mutasi) hanya dibaca dari cakupan
-    -- setinggi tempat nama pet ditemukan → label telur sebelah tidak lagi
-    -- dicatat sebagai nilai telur ini (biang "MIN 100B tapi isi 2B").
-    local texts = {}   -- { t = teks, lvl = level kedalaman }
+    -- teks PER LEVEL kedalaman: lvl 0 = milik telur sendiri, lvl naik = folder
+    -- induk (rawan label tetangga). Sinyal hanya dibaca dari cakupan setinggi
+    -- tempat nama pet ditemukan → label sebelah tidak menular.
+    local texts = {}
     if fallbackLabel then table.insert(texts, { t = fallbackLabel, lvl = 0 }) end
     pcall(function()
         local node = part
@@ -419,9 +400,8 @@ local function extractInfo(inst, part, fallbackLabel)
     local muts = {}
     local rarityTxt
     local dbBase, dbRar
-    local nameLvl = 3  -- tanpa nama = pakai cakupan penuh (perilaku lama)
+    local nameLvl = 3
 
-    -- 1) nama pet via DB (level terdalam dulu): kandidat penuh → varian tanpa mutasi
     for _, it in ipairs(texts) do
         local cand0 = lower(it.t)
         cand0 = string.gsub(cand0, "%s*egg%s*$", "")
@@ -446,14 +426,12 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end
 
-    -- 2) gabung teks HANYA dari cakupan lvl <= nameLvl
     local scoped = {}
     for _, it in ipairs(texts) do
         if it.lvl <= nameLvl then table.insert(scoped, it.t) end
     end
     local low = lower(table.concat(scoped, " | "))
 
-    -- 3) rarity via teks (cakupan aman)
     for _, r in ipairs(RARITY_ORDER) do
         if string.find(low, r, 1, true) then
             rarityTxt = r
@@ -461,7 +439,6 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end
 
-    -- 4) mutasi: token terpanjang dulu, habis match dibuang dari teks
     for _, tk in ipairs(MUT_TOKENS) do
         local found
         low, found = blankOut(low, tk.tok)
@@ -472,7 +449,6 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end
 
-    -- 5) value & multiplier (cakupan aman, teks pertama yang cocok)
     for _, t in ipairs(scoped) do
         local v = parseMoney(t)
         if v and not value then value = v end
@@ -480,14 +456,11 @@ local function extractInfo(inst, part, fallbackLabel)
         if m and not mult then mult = m end
     end
 
-    -- 6) SANITY CLAMP: value live yang keterlaluan dibanding base DB-nya
-    --    (= hampir pasti label telur tetangga) dibuang → pakai estimasi DB.
-    --    Batas 12x: stack mutasi penuh pun maks +-9x (aditif).
+    -- SANITY CLAMP: live > 12x base DB = label asing → buang, pakai estimasi DB
     if value and dbBase and dbBase > 0 and value > dbBase * 12 then
         value = nil
     end
 
-    -- 7) nama tampilan terbaik (teks tanpa $ / xN terpanjang, cakupan aman)
     if not nameTxt then
         local score = -1
         for _, t in ipairs(scoped) do
@@ -510,6 +483,9 @@ local function extractInfo(inst, part, fallbackLabel)
     return nameTxt, value, mult, muts, rarityTxt, dbBase, dbRar
 end
 
+--─────────────────────────────────────────────────────────────────────────────
+-- ESP
+--─────────────────────────────────────────────────────────────────────────────
 local function destroyESP(inst)
     local c = state.espCache[inst]
     if not c then return end
@@ -554,7 +530,7 @@ local function buildESP(inst, part, rarity, displayName)
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- DETEKSI v5 — UNION per-objek (strict ∪ name ∪ label, bukan fallback berlapis)
+-- DETEKSI — UNION per-objek (strict ∪ name ∪ billboard-label)
 --─────────────────────────────────────────────────────────────────────────────
 local function eggEntry(inst)
     local part = getPart(inst)
@@ -579,7 +555,6 @@ end
 local function collectEggs()
     local result = {}
 
-    -- pass 1: nama mengandung keyword (strict bila di container egg / beratribut)
     pcall(function()
         for _, inst in ipairs(Workspace:GetDescendants()) do
             local isPart  = inst:IsA("BasePart")
@@ -597,7 +572,6 @@ local function collectEggs()
         end
     end)
 
-    -- pass 2: label Billboard (telur reload 5 menit sering model generik)
     pcall(function()
         for _, inst in ipairs(Workspace:GetDescendants()) do
             if inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
@@ -669,7 +643,6 @@ end
 local function refreshESP()
     local new = collectEggs()
 
-    -- gabung: yang lama masih hidup dipertahankan datanya
     for inst in pairs(state.espCache) do
         if not new[inst] or not inst.Parent or not CONFIG.esp then destroyESP(inst) end
     end
@@ -710,60 +683,16 @@ local function refreshESP()
     state.rendered = math.min(#list, CONFIG.maxRendered)
 end
 
-local function scanLoop()
-    while state.alive do
-        pcall(refreshESP)
-        task.wait(CONFIG.scanInterval)
+local function resolveCurrentEggValue(data)
+    local val = data.value
+    if not val and data.dbBase then
+        val = data.dbBase * mutEffMult(data.muts)
     end
+    return val or 0
 end
-
--- pending-watchlist: telur yang datanya telat muncul (reload 5 menit) dikejar 90s
-local function pendingLoop()
-    while state.alive do
-        task.wait(1)
-        for inst, data in pairs(state.eggs) do
-            if data.pending and inst.Parent then
-                pcall(resolvePending, inst)
-            end
-        end
-    end
-end
-
--- event-driven: telur baru masuk di frame dia spawn
-Workspace.DescendantAdded:Connect(function(inst)
-    if not state.alive then return end
-    pcall(function()
-        if inst:IsA("BasePart") or inst:IsA("Model") then
-            if matchesKeyword(inst.Name) or inEggContainer(inst) then
-                addEgg(inst)
-            end
-        elseif inst:IsA("BillboardGui") and inst.Name ~= "SAEEggBB" then
-            task.defer(function()
-                if not state.alive or not inst.Parent then return end
-                for _, ch in ipairs(inst:GetDescendants()) do
-                    if ch:IsA("TextLabel") and ch.Text and (matchesKeyword(ch.Text) or parseMoney(ch.Text)) then
-                        local target
-                        if inst.Adornee and inst.Adornee:IsA("BasePart") then
-                            target = inst.Adornee
-                        elseif inst.Parent and inst.Parent:IsA("BasePart") then
-                            target = inst.Parent
-                        end
-                        if target then
-                            addEgg(target, {
-                                part = target, rarity = rarityOf(target), firstSeen = os.time(),
-                                pending = true, since = os.clock(), label = ch.Text, viaLabel = true,
-                            })
-                        end
-                        break
-                    end
-                end
-            end)
-        end
-    end)
-end)
 
 --─────────────────────────────────────────────────────────────────────────────
--- AUTO TELEPORT (ESP tab)
+-- AUTO TELEPORT (ESP assist)
 --─────────────────────────────────────────────────────────────────────────────
 local function teleportToEgg()
     if os.clock() - state.lastTP < CONFIG.tpCooldown then return end
@@ -793,15 +722,8 @@ local function teleportToEgg()
     hrp.CFrame = CFrame.new(target)
 end
 
-local function tpLoop()
-    while state.alive do
-        if state.autoTPOn then pcall(teleportToEgg) end
-        task.wait(0.25)
-    end
-end
-
 --─────────────────────────────────────────────────────────────────────────────
--- HTTP + SERVER LIST
+-- HTTP + SERVERS
 --─────────────────────────────────────────────────────────────────────────────
 local function httpGet(url)
     local body
@@ -812,7 +734,6 @@ local function httpGet(url)
     return nil
 end
 
--- excludeFull=true dipakai AUTO biar server penuh tidak dibuang-buang waktu
 function fetchServers(excludeFull)
     if state.fetching then return state.servers end
     state.fetching = true
@@ -855,7 +776,6 @@ function fetchServers(excludeFull)
     return out
 end
 
--- jumlah pemain live: server ini → lokal; server lain → cache API (≤30s)
 local function getLiveCount(jobId)
     if jobId == game.JobId then
         return #Players:GetPlayers(), Players.MaxPlayers
@@ -887,8 +807,7 @@ function joinServer(jobId)
     end
 end
 
--- JOIN feed dengan pre-check jumlah pemain:
---   7/7 = FULL skip · biasa >4/7 skip · ★TOP ≤6/7 boleh (6/7 = RACE 1 slot)
+-- JOIN pre-check: FULL skip · cap filter · TOP ≤6/7 boleh (RACE)
 function joinFinderServer(jobId, isTop)
     if not jobId or jobId == "" then return end
     if jobId == game.JobId then notify("Sudah di server itu", 2) return end
@@ -903,8 +822,8 @@ function joinFinderServer(jobId, isTop)
             if playing >= 6 then
                 notify("RACE! " .. playing .. "/7 — 1 slot, gas cepat", 4)
             end
-        elseif playing > FILTER.maxPlayers then
-            notify("Skip: " .. playing .. "/7 > batas " .. FILTER.maxPlayers .. "/7", 3)
+        elseif FILTER.capFilter > 0 and playing > FILTER.capFilter then
+            notify("Skip: " .. playing .. "/7 > batas CAP " .. FILTER.capFilter, 3)
             return
         end
     else
@@ -913,7 +832,7 @@ function joinFinderServer(jobId, isTop)
     joinServer(jobId)
 end
 
--- AUTO hop: prioritas server paling kosong (1/7) yang belum dikunjungi
+-- AUTO hop: hanya server tidak-full + hormati CAP filter, prefer paling sepi
 function pickHopTarget()
     if #state.servers == 0 or os.clock() - state.srvAt > 60 then
         pcall(fetchServers, true)
@@ -922,7 +841,9 @@ function pickHopTarget()
     local cands = {}
     for _, s in ipairs(state.servers) do
         if s.id ~= game.JobId and s.playing > 0 and s.max > 0 and s.playing < s.max then
-            table.insert(cands, s)
+            if FILTER.capFilter == 0 or s.playing <= FILTER.capFilter then
+                table.insert(cands, s)
+            end
         end
     end
     table.sort(cands, function(a, b) return a.playing < b.playing end)
@@ -937,18 +858,20 @@ function pickHopTarget()
 end
 
 --─────────────────────────────────────────────────────────────────────────────
--- UI SHELL
---────────────────────────────────────────────────────────────────────────────
-local C_BG      = Color3.fromRGB(18, 18, 22)
-local C_PANEL   = Color3.fromRGB(28, 28, 34)
-local C_STROKE  = Color3.fromRGB(58, 58, 70)
-local C_TEXT    = Color3.fromRGB(235, 235, 240)
-local C_DIM     = Color3.fromRGB(150, 150, 162)
-local C_ACCENT  = Color3.fromRGB(120, 220, 150)
-local C_GOLD    = Color3.fromRGB(255, 210, 80)
+-- UI · CLEAN DARK MINIMAL
+--─────────────────────────────────────────────────────────────────────────────
+local C_BG      = Color3.fromRGB(16, 16, 20)
+local C_PANEL   = Color3.fromRGB(24, 24, 30)
+local C_PANEL2  = Color3.fromRGB(33, 33, 41)
+local C_STROKE  = Color3.fromRGB(45, 45, 55)
+local C_TEXT    = Color3.fromRGB(240, 240, 245)
+local C_DIM     = Color3.fromRGB(145, 145, 158)
+local C_ACCENT  = Color3.fromRGB( 88, 220, 140)
+local C_GOLD    = Color3.fromRGB(255, 200, 70)
+local C_ROW     = Color3.fromRGB(22, 22, 28)
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "SAE_EggFinder"
+gui.Name = "SAE_Finder"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 999
@@ -957,8 +880,8 @@ local okParent = pcall(function() gui.Parent = game:GetService("CoreGui") end)
 if not okParent or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(470, 380)
-main.Position = UDim2.new(0.5, -235, 0.5, -190)
+main.Size = UDim2.fromOffset(520, 400)
+main.Position = UDim2.new(0.5, -260, 0.5, -200)
 main.BackgroundColor3 = C_BG
 main.BorderSizePixel = 0
 main.Active = true
@@ -970,48 +893,88 @@ mainStroke.Thickness = 1
 mainStroke.Parent = main
 
 local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.CornerRadius = UDim.new(0, 10)
 mainCorner.Parent = main
 
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 34)
-titleBar.BackgroundColor3 = C_PANEL
-titleBar.BorderSizePixel = 0
-titleBar.Parent = main
+-- hover helper (Clean Minimal feel)
+local function hoverify(btn, base, hot)
+    btn.MouseEnter:Connect(function()
+        btn.BackgroundColor3 = hot
+    end)
+    btn.MouseLeave:Connect(function()
+        btn.BackgroundColor3 = base
+    end)
+end
 
-local titleCorner = Instance.new("UICorner")
-titleCorner.CornerRadius = UDim.new(0, 8)
-titleCorner.Parent = titleBar
+-- TOPBAR
+local topbar = Instance.new("Frame")
+topbar.Size = UDim2.new(1, 0, 0, 36)
+topbar.BackgroundColor3 = C_PANEL
+topbar.BorderSizePixel = 0
+topbar.Parent = main
+
+local topCorner = Instance.new("UICorner")
+topCorner.CornerRadius = UDim.new(0, 10)
+topCorner.Parent = topbar
+
+local dot = Instance.new("Frame")
+dot.Size = UDim2.fromOffset(8, 8)
+dot.Position = UDim2.fromOffset(14, 14)
+dot.BackgroundColor3 = C_ACCENT
+dot.Parent = topbar
+local dotCorner = Instance.new("UICorner")
+dotCorner.CornerRadius = UDim.new(1, 0)
+dotCorner.Parent = dot
 
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Size = UDim2.new(1, -80, 1, 0)
-titleLabel.Position = UDim2.fromOffset(12, 0)
+titleLabel.Size = UDim2.new(1, -110, 1, 0)
+titleLabel.Position = UDim2.fromOffset(30, 0)
 titleLabel.BackgroundTransparency = 1
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
 titleLabel.TextColor3 = C_TEXT
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = "SAE · EGG FINDER v7"
-titleLabel.Parent = titleBar
+titleLabel.Text = "SAE FINDER"
+titleLabel.Parent = topbar
+
+local topBtns = Instance.new("Frame")
+topBtns.Size = UDim2.fromOffset(64, 24)
+topBtns.Position = UDim2.new(1, -72, 0, 6)
+topBtns.BackgroundTransparency = 1
+topBtns.Parent = topbar
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.fromOffset(28, 24)
+minBtn.Position = UDim2.fromOffset(0, 0)
+minBtn.BackgroundColor3 = C_PANEL
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 13
+minBtn.TextColor3 = C_DIM
+minBtn.Text = "–"
+minBtn.Parent = topBtns
+local minCorner = Instance.new("UICorner")
+minCorner.CornerRadius = UDim.new(0, 6)
+minCorner.Parent = minBtn
+hoverify(minBtn, C_PANEL, C_PANEL2)
 
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.fromOffset(24, 24)
-closeBtn.Position = UDim2.new(1, -32, 0, 5)
+closeBtn.Size = UDim2.fromOffset(28, 24)
+closeBtn.Position = UDim2.fromOffset(32, 0)
 closeBtn.BackgroundColor3 = C_PANEL
-closeBtn.Text = "×"
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 16
-closeBtn.TextColor3 = C_TEXT
-closeBtn.Parent = titleBar
-
+closeBtn.TextSize = 13
+closeBtn.TextColor3 = C_DIM
+closeBtn.Text = "×"
+closeBtn.Parent = topBtns
 local closeCorner = Instance.new("UICorner")
 closeCorner.CornerRadius = UDim.new(0, 6)
 closeCorner.Parent = closeBtn
+hoverify(closeBtn, C_PANEL, Color3.fromRGB(120, 40, 46))
 
 -- drag
 do
     local dragging, dragStart, startPos = false, nil, nil
-    titleBar.InputBegan:Connect(function(input)
+    topbar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
             dragging, dragStart, startPos = true, input.Position, main.Position
@@ -1035,18 +998,17 @@ do
     end)
 end
 
--- tabs
+-- TABS
 local tabBar = Instance.new("Frame")
-tabBar.Size = UDim2.new(1, -24, 0, 28)
+tabBar.Size = UDim2.new(1, -24, 0, 30)
 tabBar.Position = UDim2.fromOffset(12, 42)
 tabBar.BackgroundTransparency = 1
 tabBar.Parent = main
 
-local function makeTab(text, order, count)
-    count = count or 2
+local function makeTab(text, order)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1 / count, -4, 1, 0)
-    b.Position = UDim2.new(order / count, order * 4, 0, 0)
+    b.Size = UDim2.new(1 / 3, -4, 1, 0)
+    b.Position = UDim2.new(order / 3, order * 4, 0, 0)
     b.BackgroundColor3 = C_PANEL
     b.Font = Enum.Font.GothamBold
     b.TextSize = 12
@@ -1054,17 +1016,17 @@ local function makeTab(text, order, count)
     b.Text = text
     b.Parent = tabBar
     local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, 6)
+    c.CornerRadius = UDim.new(0, 7)
     c.Parent = b
     return b
 end
 
-local tabFind   = makeTab("FINDER", 0, 3)
-local tabEgg    = makeTab("ESP", 1, 3)
-local tabServer = makeTab("SERVERS", 2, 3)
+local tabFind   = makeTab("FINDER", 0)
+local tabServer = makeTab("SERVERS", 1)
+local tabSet    = makeTab("SETTINGS", 2)
 
 local pages = Instance.new("Frame")
-pages.Size = UDim2.new(1, -24, 1, -110)
+pages.Size = UDim2.new(1, -24, 1, -108)
 pages.Position = UDim2.fromOffset(12, 78)
 pages.BackgroundTransparency = 1
 pages.Parent = main
@@ -1074,48 +1036,109 @@ finderPage.Size = UDim2.fromScale(1, 1)
 finderPage.BackgroundTransparency = 1
 finderPage.Parent = pages
 
-local eggPage = Instance.new("Frame")
-eggPage.Size = UDim2.fromScale(1, 1)
-eggPage.BackgroundTransparency = 1
-eggPage.Parent = pages
-
 local srvPage = Instance.new("Frame")
 srvPage.Size = UDim2.fromScale(1, 1)
 srvPage.BackgroundTransparency = 1
 srvPage.Visible = false
 srvPage.Parent = pages
 
-local function setTab(which)
-    finderPage.Visible = which == "finder"
-    eggPage.Visible = which == "egg"
-    srvPage.Visible = which == "srv"
-    tabFind.BackgroundColor3 = which == "finder" and C_PANEL or C_BG
-    tabFind.TextColor3 = which == "finder" and C_ACCENT or C_DIM
-    tabEgg.BackgroundColor3 = which == "egg" and C_PANEL or C_BG
-    tabEgg.TextColor3 = which == "egg" and C_ACCENT or C_DIM
-    tabServer.BackgroundColor3 = which == "srv" and C_PANEL or C_BG
-    tabServer.TextColor3 = which == "srv" and C_ACCENT or C_DIM
+local setPage = Instance.new("Frame")
+setPage.Size = UDim2.fromScale(1, 1)
+setPage.BackgroundTransparency = 1
+setPage.Visible = false
+setPage.Parent = pages
+
+-- TOAST SYSTEM (kanan atas, slide-in)
+do
+    local holder = Instance.new("Frame")
+    holder.Name = "SAEToasts"
+    holder.Size = UDim2.fromOffset(280, 400)
+    holder.Position = UDim2.new(1, -290, 0, 40)
+    holder.BackgroundTransparency = 1
+    holder.Parent = gui
+
+    local hl2 = Instance.new("UIListLayout")
+    hl2.Padding = UDim.new(0, 6)
+    hl2.SortOrder = Enum.SortOrder.LayoutOrder
+    hl2.VerticalAlignment = Enum.VerticalAlignment.Top
+    hl2.Parent = holder
+
+    function toast(txt, dur, accent)
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(1, 0, 0, 40)
+        f.BackgroundColor3 = C_PANEL2
+        f.BorderSizePixel = 0
+        f.LayoutOrder = os.clock() * 1000
+        f.Parent = holder
+
+        local fc = Instance.new("UICorner")
+        fc.CornerRadius = UDim.new(0, 8)
+        fc.Parent = f
+
+        local fs = Instance.new("UIStroke")
+        fs.Color = accent or C_ACCENT
+        fs.Thickness = 1
+        fs.Transparency = 0.4
+        fs.Parent = f
+
+        local bar = Instance.new("Frame")
+        bar.Size = UDim2.fromOffset(3, 24)
+        bar.Position = UDim2.fromOffset(8, 8)
+        bar.BackgroundColor3 = accent or C_ACCENT
+        bar.BorderSizePixel = 0
+        bar.Parent = f
+        local barC = Instance.new("UICorner")
+        barC.CornerRadius = UDim.new(1, 0)
+        barC.Parent = bar
+
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(1, -30, 1, 0)
+        tl.Position = UDim2.fromOffset(20, 0)
+        tl.BackgroundTransparency = 1
+        tl.Font = Enum.Font.Gotham
+        tl.TextSize = 11
+        tl.TextColor3 = C_TEXT
+        tl.TextXAlignment = Enum.TextXAlignment.Left
+        tl.TextTruncate = Enum.TextTruncate.AtEnd
+        tl.Text = tostring(txt)
+        tl.Parent = f
+
+        f.Position = UDim2.new(1, 20, 0, 0)
+        TweenService:Create(f, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Position = UDim2.new(0, 0, 0, 0) }):Play()
+
+        task.delay(dur or 3, function()
+            if f.Parent then
+                local out = TweenService:Create(f, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+                    { Position = UDim2.new(1, 20, 0, 0) })
+                out:Play()
+                out.Completed:Wait()
+                f:Destroy()
+            end
+        end)
+    end
+
+    notify = function(txt, dur, accent)
+        pcall(toast, txt, dur, accent)
+    end
 end
-tabFind.MouseButton1Click:Connect(function() setTab("finder") end)
-tabEgg.MouseButton1Click:Connect(function() setTab("egg") end)
-tabServer.MouseButton1Click:Connect(function() setTab("srv") end)
 
 --─────────────────────────────────────────────────────────────────────────────
--- FINDER PAGE v5 — feed per-server, 2 filter terpisah, sort value desc
+-- FINDER PAGE
 --─────────────────────────────────────────────────────────────────────────────
-local btnRow1 = Instance.new("Frame")
-btnRow1.Size = UDim2.new(1, 0, 0, 28)
-btnRow1.BackgroundTransparency = 1
-btnRow1.Parent = finderPage
+local chipRow1 = Instance.new("Frame")
+chipRow1.Size = UDim2.new(1, 0, 0, 26)
+chipRow1.BackgroundTransparency = 1
+chipRow1.Parent = finderPage
 
-local btnRow2 = Instance.new("Frame")
-btnRow2.Size = UDim2.new(1, 0, 0, 28)
-btnRow2.Position = UDim2.fromOffset(0, 30)
-btnRow2.BackgroundTransparency = 1
-btnRow2.Parent = finderPage
+local chipRow2 = Instance.new("Frame")
+chipRow2.Size = UDim2.new(1, 0, 0, 26)
+chipRow2.Position = UDim2.fromOffset(0, 28)
+chipRow2.BackgroundTransparency = 1
+chipRow2.Parent = finderPage
 
-local function makeFilterBtn(text, order, parent, cols)
-    cols = cols or 3
+local function makeChip(text, order, parent, cols)
+    cols = cols or 4
     local b = Instance.new("TextButton")
     b.Size = UDim2.new(1 / cols, -4, 1, 0)
     b.Position = UDim2.new(order / cols, order * 4, 0, 0)
@@ -1124,24 +1147,55 @@ local function makeFilterBtn(text, order, parent, cols)
     b.TextSize = 10
     b.TextColor3 = C_TEXT
     b.Text = text
+    b.AutoButtonColor = false
     b.Parent = parent
     local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, 5)
+    c.CornerRadius = UDim.new(0, 6)
     c.Parent = b
+    hoverify(b, C_PANEL, C_PANEL2)
     return b
 end
 
-local btnAuto  = makeFilterBtn("AUTO OFF", 0, btnRow1, 4)
-local btnMinVal= makeFilterBtn("MIN Any", 1, btnRow1, 4)
-local btnRarity= makeFilterBtn("RARITY Any", 2, btnRow1, 4)
-local btnMut   = makeFilterBtn("MUT Any", 3, btnRow1, 4)
-local btnPlyr  = makeFilterBtn("P<=4", 0, btnRow2, 4)
-local btnReset = makeFilterBtn("RESET-WAIT OFF", 1, btnRow2, 4)
-local btnClear = makeFilterBtn("CLEAR", 2, btnRow2, 4)
+local btnAuto   = makeChip("AUTO OFF", 0, chipRow1, 4)
+local btnMinVal = makeChip("MIN Any", 1, chipRow1, 4)
+local btnRarity = makeChip("RARITY Any", 2, chipRow1, 4)
+local btnMut    = makeChip("MUT Any", 3, chipRow1, 4)
+local btnCap    = makeChip("CAP ≤4", 0, chipRow2, 4)
+local btnReset  = makeChip("RESET-WAIT OFF", 1, chipRow2, 4)
+local btnClear  = makeChip("CLEAR", 2, chipRow2, 4)
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1, 0, 0, 22)
+searchBox.Position = UDim2.fromOffset(0, 58)
+searchBox.BackgroundColor3 = C_PANEL
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 11
+searchBox.TextColor3 = C_TEXT
+searchBox.PlaceholderText = "  cari pet…  (kosongkan = semua)"
+searchBox.PlaceholderColor3 = C_DIM
+searchBox.Text = ""
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = finderPage
+local sbC = Instance.new("UICorner")
+sbC.CornerRadius = UDim.new(0, 6)
+sbC.Parent = searchBox
+local sbS = Instance.new("UIStroke")
+sbS.Color = C_STROKE
+sbS.Thickness = 1
+sbS.Parent = searchBox
+
+local renderFinder, renderServers   -- forward (dipakai closure sebelum definisi)
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    FILTER.search = lower(searchBox.Text)
+    if #FILTER.search == 0 or #FILTER.search >= 2 then
+        pcall(function() renderFinder() end)
+    end
+end)
 
 local finderSub = Instance.new("TextLabel")
 finderSub.Size = UDim2.new(1, 0, 0, 18)
-finderSub.Position = UDim2.fromOffset(0, 60)
+finderSub.Position = UDim2.fromOffset(0, 84)
 finderSub.BackgroundTransparency = 1
 finderSub.Font = Enum.Font.GothamBold
 finderSub.TextSize = 10
@@ -1151,8 +1205,8 @@ finderSub.Text = "..."
 finderSub.Parent = finderPage
 
 local finderList = Instance.new("ScrollingFrame")
-finderList.Size = UDim2.new(1, 0, 1, -82)
-finderList.Position = UDim2.fromOffset(0, 82)
+finderList.Size = UDim2.new(1, 0, 1, -106)
+finderList.Position = UDim2.fromOffset(0, 106)
 finderList.BackgroundTransparency = 1
 finderList.BorderSizePixel = 0
 finderList.ScrollBarThickness = 4
@@ -1169,7 +1223,6 @@ local function rarityColor(rar)
     return RARITY[lower(rar or "")] or RARITY.common
 end
 
--- TOP-10 DINAMIS: 10 value terbesar lintas feed; server berisi salah satunya = ★TOP
 local function computeTop()
     local all = {}
     local now = os.time()
@@ -1201,9 +1254,15 @@ local function mutText(muts)
     return table.concat(muts, "+")
 end
 
--- FINDER v6: feed FLAT Chilli-style — 1 baris = 1 egg, tanpa gambar pet
--- (ikon = kotak warna rarity + inisial; emas = member TOP-10)
-local function renderFinder()
+local function serverCapOk(players, max, isTop)
+    if players >= max then return false end          -- FULL: selalu dibuang
+    if isTop then return players <= 6 end            -- ★TOP: ≤6/7 (RACE slot)
+    if FILTER.capFilter == 0 then return true end    -- Any (non-full)
+    return players <= FILTER.capFilter
+end
+
+-- (renderFinder forward dideklarasi di atas — assign tanpa 'local')
+function renderFinder()
     for _, ch in ipairs(finderList:GetChildren()) do
         if ch:IsA("Frame") or ch:IsA("TextLabel") then ch:Destroy() end
     end
@@ -1219,14 +1278,13 @@ local function renderFinder()
     local topSet = {}
     for _, e in ipairs(topEggs) do topSet[e] = true end
 
-    -- kumpulkan baris flat: egg lolos filter + server lolos batas pemain
     local rows = {}
     local nEgg, nServer, nTop = 0, 0, 0
     for jobId, srv in pairs(feed.servers) do
         nServer = nServer + 1
         nEgg = nEgg + #(srv.eggs or {})
-        if topServers[jobId] then nTop = nTop + 1 end
         local isTopSrv = topServers[jobId] == true
+        if isTopSrv then nTop = nTop + 1 end
         local live = state.srvById[jobId]
         if live and os.clock() - state.srvAt < 30 then
             srv.players = live.playing
@@ -1234,7 +1292,7 @@ local function renderFinder()
         end
         local players = srv.players or 0
         local cap = srv.max or 7
-        if players < cap and (isTopSrv or players <= FILTER.maxPlayers) then
+        if serverCapOk(players, cap, isTopSrv) then
             for _, e in ipairs(srv.eggs or {}) do
                 if matchesFilters(e) then
                     table.insert(rows, { e = e, srv = srv, isTop = isTopSrv or topSet[e] == true })
@@ -1243,7 +1301,6 @@ local function renderFinder()
         end
     end
 
-    -- sort: member TOP dulu → value desc → terbaru
     table.sort(rows, function(a, b)
         local ta, tb = a.isTop and 1 or 0, b.isTop and 1 or 0
         if ta ~= tb then return ta > tb end
@@ -1273,36 +1330,34 @@ local function renderFinder()
         local e, srv, isTop = item.e, item.srv, item.isTop
 
         local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 36)
-        row.BackgroundColor3 = isTop and Color3.fromRGB(45, 37, 18) or Color3.fromRGB(24, 24, 30)
+        row.Size = UDim2.new(1, -6, 0, 38)
+        row.BackgroundColor3 = isTop and Color3.fromRGB(46, 38, 18) or C_ROW
         row.LayoutOrder = i
         row.Parent = finderList
         local rc = Instance.new("UICorner")
-        rc.CornerRadius = UDim.new(0, 6)
+        rc.CornerRadius = UDim.new(0, 7)
         rc.Parent = row
 
-        -- ikon pengganti gambar: kotak warna rarity (+ inisial), emas = TOP
         local ic = Instance.new("Frame")
-        ic.Size = UDim2.fromOffset(24, 24)
-        ic.Position = UDim2.fromOffset(5, 6)
+        ic.Size = UDim2.fromOffset(26, 26)
+        ic.Position = UDim2.fromOffset(6, 6)
         ic.BackgroundColor3 = isTop and C_GOLD or rarityColor(e.rarity)
         ic.Parent = row
         local icc = Instance.new("UICorner")
-        icc.CornerRadius = UDim.new(0, 6)
+        icc.CornerRadius = UDim.new(0, 7)
         icc.Parent = ic
         local icTxt = Instance.new("TextLabel")
         icTxt.Size = UDim2.fromScale(1, 1)
         icTxt.BackgroundTransparency = 1
         icTxt.Font = Enum.Font.GothamBold
-        icTxt.TextSize = 12
-        icTxt.TextColor3 = Color3.fromRGB(20, 20, 24)
-        icTxt.Text = isTop and "*" or string.upper(string.sub(e.name or "?", 1, 1))
+        icTxt.TextSize = 13
+        icTxt.TextColor3 = Color3.fromRGB(18, 18, 22)
+        icTxt.Text = isTop and "★" or string.upper(string.sub(e.name or "?", 1, 1))
         icTxt.Parent = ic
 
-        -- nama pet (baris 1 kiri)
         local nm = Instance.new("TextLabel")
-        nm.Size = UDim2.fromOffset(130, 14)
-        nm.Position = UDim2.fromOffset(34, 4)
+        nm.Size = UDim2.fromOffset(150, 14)
+        nm.Position = UDim2.fromOffset(38, 4)
         nm.BackgroundTransparency = 1
         nm.Font = Enum.Font.GothamBold
         nm.TextSize = 11
@@ -1312,15 +1367,14 @@ local function renderFinder()
         nm.Text = e.name or "?"
         nm.Parent = row
 
-        -- baris 2 kiri: rarity · pemain x/7 (live) · umur
-        local pcol = "#78E68C"
+        local pcol = "#58DC8C"
         if (srv.players or 0) >= 6 then pcol = "#FF8C3C"
         elseif (srv.players or 0) >= 5 then pcol = "#FFB85C" end
         local rarCap = string.upper(string.sub(e.rarity or "common", 1, 1)) ..
             string.sub(e.rarity or "common", 2)
         local sub = Instance.new("TextLabel")
-        sub.Size = UDim2.fromOffset(206, 11)
-        sub.Position = UDim2.fromOffset(34, 20)
+        sub.Size = UDim2.fromOffset(210, 11)
+        sub.Position = UDim2.fromOffset(38, 21)
         sub.BackgroundTransparency = 1
         sub.Font = Enum.Font.Gotham
         sub.TextSize = 9
@@ -1329,16 +1383,15 @@ local function renderFinder()
         sub.TextTruncate = Enum.TextTruncate.AtEnd
         sub.RichText = true
         sub.Text = string.format("%s%s · <font color=\"%s\">%d/%d</font> · %s",
-            isTop and "*TOP · " or "", rarCap, pcol,
+            isTop and "★TOP · " or "", rarCap, pcol,
             srv.players or 0, srv.max or 7, fmtAge(e.ts))
         sub.Parent = row
 
-        -- badge mutasi (zona tengah; muncul hanya kalau ada)
         local muts = mutText(e.muts)
         if muts then
             local pill = Instance.new("TextLabel")
             pill.Size = UDim2.fromOffset(70, 16)
-            pill.Position = UDim2.new(1, -246, 0, 4)
+            pill.Position = UDim2.new(1, -246, 0, 5)
             pill.BackgroundColor3 = Color3.fromRGB(38, 38, 46)
             pill.Font = Enum.Font.GothamBold
             pill.TextSize = 9
@@ -1351,10 +1404,9 @@ local function renderFinder()
             pc.Parent = pill
         end
 
-        -- value (kanan, baris 1) + x-mult (baris 2)
         local val = Instance.new("TextLabel")
-        val.Size = UDim2.fromOffset(146, 14)
-        val.Position = UDim2.new(1, -196, 0, 4)
+        val.Size = UDim2.fromOffset(150, 14)
+        val.Position = UDim2.new(1, -200, 0, 4)
         val.BackgroundTransparency = 1
         val.Font = Enum.Font.GothamBold
         val.TextSize = 11
@@ -1365,8 +1417,8 @@ local function renderFinder()
         val.Parent = row
 
         local xinfo = Instance.new("TextLabel")
-        xinfo.Size = UDim2.fromOffset(146, 11)
-        xinfo.Position = UDim2.new(1, -196, 0, 20)
+        xinfo.Size = UDim2.fromOffset(150, 11)
+        xinfo.Position = UDim2.new(1, -200, 0, 21)
         xinfo.BackgroundTransparency = 1
         xinfo.Font = Enum.Font.Gotham
         xinfo.TextSize = 9
@@ -1375,19 +1427,25 @@ local function renderFinder()
         xinfo.Text = (e.mult or 0) > 1 and ("x" .. string.format("%.2f", e.mult)) or ""
         xinfo.Parent = row
 
-        -- JOIN per baris (server milik egg ini)
         local jb = Instance.new("TextButton")
-        jb.Size = UDim2.fromOffset(46, 24)
-        jb.Position = UDim2.new(1, -51, 0, 6)
+        jb.Size = UDim2.fromOffset(46, 26)
+        jb.Position = UDim2.new(1, -52, 0, 6)
         jb.BackgroundColor3 = isTop and C_GOLD or Color3.fromRGB(255, 150, 40)
         jb.Font = Enum.Font.GothamBold
         jb.TextSize = 11
         jb.TextColor3 = Color3.fromRGB(30, 20, 5)
         jb.Text = "JOIN"
+        jb.AutoButtonColor = false
         jb.Parent = row
         local jc = Instance.new("UICorner")
         jc.CornerRadius = UDim.new(0, 6)
         jc.Parent = jb
+        jb.MouseEnter:Connect(function()
+            jb.BackgroundColor3 = isTop and Color3.fromRGB(255, 220, 110) or Color3.fromRGB(255, 175, 70)
+        end)
+        jb.MouseLeave:Connect(function()
+            jb.BackgroundColor3 = isTop and C_GOLD or Color3.fromRGB(255, 150, 40)
+        end)
         jb.MouseButton1Click:Connect(function()
             joinFinderServer(srv.jobId, isTop)
         end)
@@ -1401,12 +1459,12 @@ local function syncButtons()
         string.gsub(fmtValue(FILTER.minValue), "/s$", "") or "Any")
     btnRarity.Text = "RARITY " .. (FILTER.rarity == "any" and "Any" or FILTER.rarity)
     btnMut.Text = "MUT " .. (FILTER.mut == "any" and "Any" or FILTER.mut)
-    btnPlyr.Text = "P<=" .. FILTER.maxPlayers
+    btnCap.Text = FILTER.capFilter == 0 and "CAP Any" or ("CAP ≤" .. FILTER.capFilter)
     btnReset.Text = FILTER.waitReset and "RESET-WAIT ON" or "RESET-WAIT OFF"
     btnReset.TextColor3 = FILTER.waitReset and C_ACCENT or C_DIM
 end
 
-local minIdx, rarIdx, mutIdx, plyIdx = 1, 1, 1, 4
+local minIdx, rarIdx, mutIdx, capIdx = 1, 1, 1, 1
 btnMinVal.MouseButton1Click:Connect(function()
     minIdx = minIdx % #VALUE_STEPS + 1
     FILTER.minValue = VALUE_STEPS[minIdx]
@@ -1425,9 +1483,9 @@ btnMut.MouseButton1Click:Connect(function()
     syncButtons()
     pcall(renderFinder)
 end)
-btnPlyr.MouseButton1Click:Connect(function()
-    plyIdx = plyIdx % 6 + 1
-    FILTER.maxPlayers = plyIdx
+btnCap.MouseButton1Click:Connect(function()
+    capIdx = capIdx % #CAP_STEPS + 1
+    FILTER.capFilter = CAP_STEPS[capIdx]
     syncButtons()
     pcall(renderFinder)
 end)
@@ -1456,21 +1514,21 @@ btnAuto.MouseButton1Click:Connect(function()
 end)
 
 --─────────────────────────────────────────────────────────────────────────────
--- SHARED WIDGET HELPERS
+-- SETTINGS PAGE (toggle knob animasi)
 --─────────────────────────────────────────────────────────────────────────────
-local function makeToggle(parent, text, initial, yPos, onChanged)
+local function makeToggleRow(parent, text, initial, yPos, onChanged)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 30)
+    row.Size = UDim2.new(1, 0, 0, 32)
     row.Position = UDim2.fromOffset(0, yPos)
     row.BackgroundColor3 = C_PANEL
     row.BorderSizePixel = 0
     row.Parent = parent
     local rc = Instance.new("UICorner")
-    rc.CornerRadius = UDim.new(0, 6)
+    rc.CornerRadius = UDim.new(0, 7)
     rc.Parent = row
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -70, 1, 0)
+    lbl.Size = UDim2.new(1, -80, 1, 0)
     lbl.Position = UDim2.fromOffset(10, 0)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.Gotham
@@ -1480,193 +1538,138 @@ local function makeToggle(parent, text, initial, yPos, onChanged)
     lbl.Text = text
     lbl.Parent = row
 
-    local stateOn = initial
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(52, 20)
-    btn.Position = UDim2.new(1, -62, 0, 5)
-    btn.BackgroundColor3 = stateOn and C_ACCENT or Color3.fromRGB(60, 60, 70)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 11
-    btn.TextColor3 = Color3.fromRGB(16, 16, 18)
-    btn.Text = stateOn and "ON" or "OFF"
-    btn.Parent = row
-    local bc = Instance.new("UICorner")
-    bc.CornerRadius = UDim.new(0, 5)
-    bc.Parent = btn
+    local track = Instance.new("Frame")
+    track.Size = UDim2.fromOffset(46, 22)
+    track.Position = UDim2.new(1, -56, 0.5, -11)
+    track.BackgroundColor3 = initial and C_ACCENT or Color3.fromRGB(55, 55, 66)
+    track.BorderSizePixel = 0
+    track.Parent = row
+    local tc2 = Instance.new("UICorner")
+    tc2.CornerRadius = UDim.new(1, 0)
+    tc2.Parent = track
 
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(16, 16)
+    knob.Position = initial and UDim2.new(1, -19, 0.5, -8) or UDim2.fromOffset(3, 3)
+    knob.BackgroundColor3 = initial and Color3.fromRGB(14, 30, 20) or C_DIM
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    local kc2 = Instance.new("UICorner")
+    kc2.CornerRadius = UDim.new(1, 0)
+    kc2.Parent = knob
+
+    local on = initial
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromScale(1, 1)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.Parent = track
     btn.MouseButton1Click:Connect(function()
-        stateOn = not stateOn
-        btn.Text = stateOn and "ON" or "OFF"
-        btn.BackgroundColor3 = stateOn and C_ACCENT or Color3.fromRGB(60, 60, 70)
-        if onChanged then onChanged(stateOn) end
+        on = not on
+        TweenService:Create(track, TweenInfo.new(0.15),
+            { BackgroundColor3 = on and C_ACCENT or Color3.fromRGB(55, 55, 66) }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Position = on and UDim2.new(1, -19, 0.5, -8) or UDim2.fromOffset(3, 3),
+              BackgroundColor3 = on and Color3.fromRGB(14, 30, 20) or C_DIM }):Play()
+        if onChanged then onChanged(on) end
     end)
     return row
 end
 
---─────────────────────────────────────────────────────────────────────────────
--- EGG PAGE (ESP)
---─────────────────────────────────────────────────────────────────────────────
-local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, 0, 0, 20)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Font = Enum.Font.GothamBold
-statusLabel.TextSize = 12
-statusLabel.TextColor3 = C_ACCENT
-statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "menunggu scan..."
-statusLabel.Parent = eggPage
+local function makeButtonRow(parent, text, yPos, accent, cb)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, 32)
+    b.Position = UDim2.fromOffset(0, yPos)
+    b.BackgroundColor3 = C_PANEL
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.TextColor3 = accent or C_TEXT
+    b.Text = text
+    b.AutoButtonColor = false
+    b.Parent = parent
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = b
+    hoverify(b, C_PANEL, C_PANEL2)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
 
-makeToggle(eggPage, "ESP (nama + jarak + highlight)", true, 24, function(on)
+makeToggleRow(setPage, "ESP (nama + jarak + highlight)", true, 0, function(on)
     CONFIG.esp = on
+    if not on then
+        for inst in pairs(state.espCache) do destroyESP(inst) end
+    end
 end)
 
-makeToggle(eggPage, "Auto-teleport ke egg terdekat", false, 58, function(on)
+makeToggleRow(setPage, "Auto-teleport ke egg terdekat", false, 38, function(on)
     state.autoTPOn = on
     notify(on and "Auto-TP aktif" or "Auto-TP nonaktif", 2)
 end)
 
 local rangeRow = Instance.new("Frame")
-rangeRow.Size = UDim2.new(1, 0, 0, 30)
-rangeRow.Position = UDim2.fromOffset(0, 92)
+rangeRow.Size = UDim2.new(1, 0, 0, 32)
+rangeRow.Position = UDim2.fromOffset(0, 76)
 rangeRow.BackgroundColor3 = C_PANEL
-rangeRow.Parent = eggPage
+rangeRow.BorderSizePixel = 0
+rangeRow.Parent = setPage
 local rrC = Instance.new("UICorner")
-rrC.CornerRadius = UDim.new(0, 6)
+rrC.CornerRadius = UDim.new(0, 7)
 rrC.Parent = rangeRow
 
 local rangeLbl = Instance.new("TextLabel")
-rangeLbl.Size = UDim2.new(1, -70, 1, 0)
+rangeLbl.Size = UDim2.new(1, -80, 1, 0)
 rangeLbl.Position = UDim2.fromOffset(10, 0)
 rangeLbl.BackgroundTransparency = 1
 rangeLbl.Font = Enum.Font.Gotham
 rangeLbl.TextSize = 12
 rangeLbl.TextColor3 = C_TEXT
 rangeLbl.TextXAlignment = Enum.TextXAlignment.Left
-rangeLbl.Text = "Range maksimum"
+rangeLbl.Text = "Range maksimum (m)"
 rangeLbl.Parent = rangeRow
 
 local rangeBox = Instance.new("TextBox")
-rangeBox.Size = UDim2.fromOffset(52, 20)
-rangeBox.Position = UDim2.new(1, -62, 0, 5)
-rangeBox.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+rangeBox.Size = UDim2.fromOffset(56, 22)
+rangeBox.Position = UDim2.new(1, -62, 0.5, -11)
+rangeBox.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
 rangeBox.Font = Enum.Font.GothamBold
 rangeBox.TextSize = 11
 rangeBox.TextColor3 = C_TEXT
 rangeBox.Text = tostring(CONFIG.maxDistance)
 rangeBox.Parent = rangeRow
 local rbC = Instance.new("UICorner")
-rbC.CornerRadius = UDim.new(0, 5)
+rbC.CornerRadius = UDim.new(0, 6)
 rbC.Parent = rangeBox
 rangeBox.FocusLost:Connect(function()
     local n = tonumber(rangeBox.Text)
     if n and n >= 50 then CONFIG.maxDistance = math.floor(n) else rangeBox.Text = tostring(CONFIG.maxDistance) end
 end)
 
-local eggList = Instance.new("ScrollingFrame")
-eggList.Size = UDim2.new(1, 0, 1, -128)
-eggList.Position = UDim2.fromOffset(0, 128)
-eggList.BackgroundTransparency = 1
-eggList.BorderSizePixel = 0
-eggList.ScrollBarThickness = 4
-eggList.CanvasSize = UDim2.new()
-eggList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-eggList.Parent = eggPage
+makeButtonRow(setPage, "DEBUG DUMP (console + clipboard)", 118, C_DIM, function()
+    if _G.SAE_FINDER and _G.SAE_FINDER.dump then _G.SAE_FINDER.dump() end
+end)
 
-local eggLayout = Instance.new("UIListLayout")
-eggLayout.Padding = UDim.new(0, 3)
-eggLayout.SortOrder = Enum.SortOrder.LayoutOrder
-eggLayout.Parent = eggList
+makeButtonRow(setPage, "CLEAR FEED", 156, C_DIM, function()
+    feed.servers = {}
+    saveFeed()
+    pcall(renderFinder)
+    notify("Feed dibersihkan", 2)
+end)
 
-local function renderEggList()
-    for _, ch in ipairs(eggList:GetChildren()) do
-        if ch:IsA("Frame") then ch:Destroy() end
-    end
-    local list = {}
-    for inst, data in pairs(state.eggs) do
-        if inst.Parent and data.part and data.part.Parent then
-            local d = distTo(data.part)
-            if d <= CONFIG.maxDistance then
-                table.insert(list, { inst = inst, part = data.part, rarity = data.rarity, name = data.name, d = d })
-            end
-        end
-    end
-    table.sort(list, function(a, b) return a.d < b.d end)
-
-    for i = 1, math.min(#list, 14) do
-        local e = list[i]
-        local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 22)
-        row.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
-        row.LayoutOrder = i
-        row.Parent = eggList
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 4)
-        c.Parent = row
-
-        local dot = Instance.new("Frame")
-        dot.Size = UDim2.fromOffset(6, 6)
-        dot.Position = UDim2.new(0, 6, 0.5, -3)
-        dot.BackgroundColor3 = RARITY[e.rarity] or RARITY.common
-        dot.Parent = row
-        local dc = Instance.new("UICorner")
-        dc.CornerRadius = UDim.new(1, 0)
-        dc.Parent = dot
-
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, -80, 1, 0)
-        lbl.Position = UDim2.fromOffset(18, 0)
-        lbl.BackgroundTransparency = 1
-        lbl.Font = Enum.Font.Gotham
-        lbl.TextSize = 11
-        lbl.TextColor3 = C_TEXT
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.TextTruncate = Enum.TextTruncate.AtEnd
-        lbl.Text = e.name or e.inst.Name
-        lbl.Parent = row
-
-        local dlbl = Instance.new("TextLabel")
-        dlbl.Size = UDim2.fromOffset(40, 22)
-        dlbl.Position = UDim2.new(1, -78, 0, 0)
-        dlbl.BackgroundTransparency = 1
-        dlbl.Font = Enum.Font.GothamBold
-        dlbl.TextSize = 11
-        dlbl.TextColor3 = C_DIM
-        dlbl.Text = string.format("%dm", math.floor(e.d))
-        dlbl.Parent = row
-
-        local tp = Instance.new("TextButton")
-        tp.Size = UDim2.fromOffset(30, 16)
-        tp.Position = UDim2.new(1, -38, 0, 3)
-        tp.BackgroundColor3 = C_PANEL
-        tp.Font = Enum.Font.GothamBold
-        tp.TextSize = 10
-        tp.TextColor3 = C_ACCENT
-        tp.Text = "TP"
-        tp.Parent = row
-        local tc = Instance.new("UICorner")
-        tc.CornerRadius = UDim.new(0, 4)
-        tc.Parent = tp
-
-        tp.MouseButton1Click:Connect(function()
-            local char = LP.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp and e.part and e.part.Parent then
-                hrp.CFrame = CFrame.new(e.part.Position + Vector3.new(0, CONFIG.tpOffset, 0))
-            end
-        end)
-    end
-end
+makeButtonRow(setPage, "UNLOAD (END)", 194, Color3.fromRGB(255, 120, 120), function()
+    if _G.SAE_FINDER then _G.SAE_FINDER.unload() end
+end)
 
 --─────────────────────────────────────────────────────────────────────────────
--- SERVER PAGE
+-- SERVERS PAGE (occupancy bar)
 --─────────────────────────────────────────────────────────────────────────────
 local srvHead = Instance.new("Frame")
-srvHead.Size = UDim2.new(1, 0, 0, 24)
+srvHead.Size = UDim2.new(1, 0, 0, 26)
 srvHead.BackgroundTransparency = 1
 srvHead.Parent = srvPage
 
 local srvInfo = Instance.new("TextLabel")
-srvInfo.Size = UDim2.new(1, -70, 1, 0)
+srvInfo.Size = UDim2.new(1, -80, 1, 0)
 srvInfo.BackgroundTransparency = 1
 srvInfo.Font = Enum.Font.GothamBold
 srvInfo.TextSize = 11
@@ -1676,21 +1679,23 @@ srvInfo.Text = "server saat ini: ..."
 srvInfo.Parent = srvHead
 
 local refreshBtn = Instance.new("TextButton")
-refreshBtn.Size = UDim2.fromOffset(64, 20)
-refreshBtn.Position = UDim2.new(1, -64, 0, 2)
+refreshBtn.Size = UDim2.fromOffset(72, 22)
+refreshBtn.Position = UDim2.new(1, -72, 0, 2)
 refreshBtn.BackgroundColor3 = C_PANEL
 refreshBtn.Font = Enum.Font.GothamBold
 refreshBtn.TextSize = 11
 refreshBtn.TextColor3 = C_ACCENT
 refreshBtn.Text = "REFRESH"
+refreshBtn.AutoButtonColor = false
 refreshBtn.Parent = srvHead
 local rfC = Instance.new("UICorner")
-rfC.CornerRadius = UDim.new(0, 5)
+rfC.CornerRadius = UDim.new(0, 6)
 rfC.Parent = refreshBtn
+hoverify(refreshBtn, C_PANEL, C_PANEL2)
 
 local srvList = Instance.new("ScrollingFrame")
-srvList.Size = UDim2.new(1, 0, 1, -28)
-srvList.Position = UDim2.fromOffset(0, 28)
+srvList.Size = UDim2.new(1, 0, 1, -30)
+srvList.Position = UDim2.fromOffset(0, 30)
 srvList.BackgroundTransparency = 1
 srvList.BorderSizePixel = 0
 srvList.ScrollBarThickness = 4
@@ -1711,7 +1716,8 @@ local function playerColor(playing, max)
     return C_ACCENT
 end
 
-local function renderServers()
+-- (renderServers forward dideklarasi di atas)
+function renderServers()
     for _, ch in ipairs(srvList:GetChildren()) do
         if ch:IsA("Frame") then ch:Destroy() end
     end
@@ -1728,17 +1734,18 @@ local function renderServers()
     end
 
     for i, s in ipairs(state.servers) do
+        if i > 60 then break end
         local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 24)
-        row.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+        row.Size = UDim2.new(1, -6, 0, 28)
+        row.BackgroundColor3 = C_ROW
         row.LayoutOrder = i
         row.Parent = srvList
         local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 4)
+        c.CornerRadius = UDim.new(0, 6)
         c.Parent = row
 
         local idlbl = Instance.new("TextLabel")
-        idlbl.Size = UDim2.new(1, -130, 1, 0)
+        idlbl.Size = UDim2.fromOffset(70, 28)
         idlbl.Position = UDim2.fromOffset(8, 0)
         idlbl.BackgroundTransparency = 1
         idlbl.Font = Enum.Font.Code
@@ -1748,9 +1755,30 @@ local function renderServers()
         idlbl.Text = string.sub(s.id, 1, 8)
         idlbl.Parent = row
 
+        -- occupancy bar (Clean Minimal: bar tipis warna status)
+        local ratio = (s.max > 0) and (s.playing / s.max) or 0
+        local barBG = Instance.new("Frame")
+        barBG.Size = UDim2.fromOffset(60, 6)
+        barBG.Position = UDim2.fromOffset(84, 11)
+        barBG.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+        barBG.BorderSizePixel = 0
+        barBG.Parent = row
+        local bgC = Instance.new("UICorner")
+        bgC.CornerRadius = UDim.new(1, 0)
+        bgC.Parent = barBG
+
+        local barFG = Instance.new("Frame")
+        barFG.Size = UDim2.new(math.min(ratio, 1), 0, 1, 0)
+        barFG.BackgroundColor3 = playerColor(s.playing, s.max)
+        barFG.BorderSizePixel = 0
+        barFG.Parent = barBG
+        local fgC = Instance.new("UICorner")
+        fgC.CornerRadius = UDim.new(1, 0)
+        fgC.Parent = barFG
+
         local plbl = Instance.new("TextLabel")
-        plbl.Size = UDim2.fromOffset(46, 24)
-        plbl.Position = UDim2.new(1, -112, 0, 0)
+        plbl.Size = UDim2.fromOffset(44, 28)
+        plbl.Position = UDim2.fromOffset(150, 0)
         plbl.BackgroundTransparency = 1
         plbl.Font = Enum.Font.GothamBold
         plbl.TextSize = 11
@@ -1759,8 +1787,8 @@ local function renderServers()
         plbl.Parent = row
 
         local pinglbl = Instance.new("TextLabel")
-        pinglbl.Size = UDim2.fromOffset(36, 24)
-        pinglbl.Position = UDim2.new(1, -64, 0, 0)
+        pinglbl.Size = UDim2.fromOffset(44, 28)
+        pinglbl.Position = UDim2.fromOffset(198, 0)
         pinglbl.BackgroundTransparency = 1
         pinglbl.Font = Enum.Font.Gotham
         pinglbl.TextSize = 10
@@ -1769,17 +1797,20 @@ local function renderServers()
         pinglbl.Parent = row
 
         local jb = Instance.new("TextButton")
-        jb.Size = UDim2.fromOffset(40, 18)
-        jb.Position = UDim2.new(1, -42, 0, 3)
+        jb.Size = UDim2.fromOffset(44, 20)
+        jb.Position = UDim2.new(1, -50, 0, 4)
         jb.BackgroundColor3 = C_PANEL
         jb.Font = Enum.Font.GothamBold
         jb.TextSize = 10
         jb.TextColor3 = C_ACCENT
         jb.Text = "JOIN"
+        jb.AutoButtonColor = false
         jb.Parent = row
         local jc = Instance.new("UICorner")
-        jc.CornerRadius = UDim.new(0, 4)
+        jc.CornerRadius = UDim.new(0, 5)
         jc.Parent = jb
+        jb.MouseEnter:Connect(function() jb.BackgroundColor3 = C_PANEL2 end)
+        jb.MouseLeave:Connect(function() jb.BackgroundColor3 = C_PANEL end)
         jb.MouseButton1Click:Connect(function() joinServer(s.id) end)
     end
 end
@@ -1794,6 +1825,24 @@ refreshBtn.MouseButton1Click:Connect(function()
 end)
 
 --─────────────────────────────────────────────────────────────────────────────
+-- TAB SWITCH
+--─────────────────────────────────────────────────────────────────────────────
+local function setTab(which)
+    finderPage.Visible = which == "finder"
+    srvPage.Visible = which == "srv"
+    setPage.Visible = which == "set"
+    tabFind.BackgroundColor3 = which == "finder" and C_PANEL2 or C_PANEL
+    tabFind.TextColor3 = which == "finder" and C_ACCENT or C_DIM
+    tabServer.BackgroundColor3 = which == "srv" and C_PANEL2 or C_PANEL
+    tabServer.TextColor3 = which == "srv" and C_ACCENT or C_DIM
+    tabSet.BackgroundColor3 = which == "set" and C_PANEL2 or C_PANEL
+    tabSet.TextColor3 = which == "set" and C_ACCENT or C_DIM
+end
+tabFind.MouseButton1Click:Connect(function() setTab("finder") end)
+tabServer.MouseButton1Click:Connect(function() setTab("srv") end)
+tabSet.MouseButton1Click:Connect(function() setTab("set") end)
+
+--─────────────────────────────────────────────────────────────────────────────
 -- FOOTER
 --─────────────────────────────────────────────────────────────────────────────
 local footer = Instance.new("TextLabel")
@@ -1804,23 +1853,45 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v7"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v8.0 clean"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
 -- LOOPS
 --─────────────────────────────────────────────────────────────────────────────
+local function scanLoop()
+    while state.alive do
+        pcall(refreshESP)
+        task.wait(CONFIG.scanInterval)
+    end
+end
+
+local function pendingLoop()
+    while state.alive do
+        task.wait(1)
+        for inst, data in pairs(state.eggs) do
+            if data.pending and inst.Parent then
+                pcall(resolvePending, inst)
+            end
+        end
+    end
+end
+
+local function tpLoop()
+    while state.alive do
+        if state.autoTPOn then pcall(teleportToEgg) end
+        task.wait(0.25)
+    end
+end
+
 local function statusLoop()
     while state.alive do
         local found = 0
         for _ in pairs(state.eggs) do found = found + 1 end
         local here = #Players:GetPlayers()
-        local cap = Players.MaxPlayers
-        srvInfo.Text = string.format("server saat ini: %d/%d pemain", here, cap)
-        statusLabel.Text = string.format(
-            "egg: %d · mode:%s · tampil:%d · auto-tp:%s",
-            found, state.scanMode or "-", state.rendered, state.autoTPOn and "ON" or "OFF"
-        )
+        srvInfo.Text = string.format("server saat ini: %d/%d pemain · %s",
+            here, Players.MaxPlayers, string.sub(game.JobId or "", 1, 8))
+        dot.BackgroundColor3 = found > 0 and C_ACCENT or Color3.fromRGB(220, 170, 80)
         task.wait(0.5)
     end
 end
@@ -1828,12 +1899,12 @@ end
 local function listLoop()
     while state.alive do
         if finderPage.Visible then pcall(renderFinder) end
-        if eggPage.Visible then pcall(renderEggList) end
+        if srvPage.Visible and #state.servers > 0 then pcall(renderServers) end
         task.wait(1)
     end
 end
 
--- filter egg-level untuk feed/AUTO
+-- filter egg-level untuk feed/AUTO (min + rarity + mut + search)
 function matchesFilters(e)
     if FILTER.minValue > 0 and (eggValue(e) or 0) < FILTER.minValue then return false end
     if FILTER.rarity ~= "any" and lower(e.rarity or "") ~= FILTER.rarity then return false end
@@ -1844,16 +1915,20 @@ function matchesFilters(e)
         end
         if not hit then return false end
     end
+    if FILTER.search ~= "" and FILTER.search ~= nil then
+        local nm = lower(e.name or "")
+        if not string.find(nm, FILTER.search, 1, true) then return false end
+    end
     return true
 end
 
--- perekam feed: snapshot egg server ini → feed.servers[jobId] (rebuild = tahan reset 5 menit)
+-- perekam feed: snapshot egg server ini → feed.servers[jobId]
 local function feedLoop()
     while state.alive do
         task.wait(2)
         local job = game.JobId
         if job and job ~= "" then
-            local eggs, changed = {}, false
+            local eggs = {}
             local n = 0
             for inst, data in pairs(state.eggs) do
                 if inst.Parent and data.part and data.part.Parent then
@@ -1886,9 +1961,7 @@ local function feedLoop()
 
             local old = feed.servers[job]
             local here = #Players:GetPlayers()
-            if not old or old.eggCount ~= n or here ~= (old.players or -1) then
-                changed = true
-            end
+            local changed = (not old) or old.eggCount ~= n or here ~= (old.players or -1)
 
             local list = {}
             for _, e in pairs(eggs) do table.insert(list, e) end
@@ -1903,10 +1976,9 @@ local function feedLoop()
                 eggCount = n,
             }
 
-            -- buang server kadaluarsa
-            local now = os.time()
+            local now2 = os.time()
             for jid, srv in pairs(feed.servers) do
-                if now - (srv.lastSeen or 0) > CONFIG.feedExpiry then
+                if now2 - (srv.lastSeen or 0) > CONFIG.feedExpiry then
                     feed.servers[jid] = nil
                     changed = true
                 end
@@ -1925,21 +1997,18 @@ local function autoLoop()
     while state.alive do
         task.wait(0.5)
         if FILTER.auto and os.clock() - (state.lastHop or 0) >= FILTER.interval then
-            -- RESET-WAIT: hop hanya di jendela ±25s setelah tick reset 5 menit
             if FILTER.waitReset and (os.time() % CONFIG.resetCycle) > 25 then
-                -- di luar jendela: tunggu, feed terus direfresh oleh feedLoop
+                -- di luar jendela reset: tunggu, feed terus direfresh
             else
                 state.lastHop = os.clock()
                 local haveMatch = false
                 for inst, data in pairs(state.eggs) do
                     if data.part and data.part.Parent then
-                        local eff = mutEffMult(data.muts)
-                        local val = data.value
-                        if not val and data.dbBase then val = data.dbBase * eff end
                         if matchesFilters({
-                            value = val or 0,
+                            value = resolveCurrentEggValue(data),
                             rarity = data.rarity,
                             muts = data.muts,
+                            name = data.name,
                         }) then
                             haveMatch = true
                             break
@@ -1947,7 +2016,7 @@ local function autoLoop()
                     end
                 end
                 if haveMatch then
-                    notify("Target lolos filter ada di server ini!", 4)
+                    notify("Target lolos filter ada di server ini!", 4, C_GOLD)
                 else
                     local target = pickHopTarget()
                     if target then
@@ -1974,12 +2043,11 @@ local function unload()
     state.alive = false
     for inst in pairs(state.espCache) do destroyESP(inst) end
     pcall(function() gui:Destroy() end)
-    _G.SAE_EGGF = nil
-    notify("Unloaded", 2)
+    _G.SAE_FINDER = nil
+    notify("SAE Finder unloaded", 2)
 end
 
-local inputConn
-inputConn = UserInputService.InputBegan:Connect(function(input, gep)
+UserInputService.InputBegan:Connect(function(input, gep)
     if gep then return end
     if input.KeyCode == Enum.KeyCode.RightShift then
         main.Visible = not main.Visible
@@ -1988,9 +2056,14 @@ inputConn = UserInputService.InputBegan:Connect(function(input, gep)
     end
 end)
 
-closeBtn.MouseButton1Click:Connect(unload)
+closeBtn.MouseButton1Click:Connect(function()
+    main.Visible = false
+end)
+minBtn.MouseButton1Click:Connect(function()
+    main.Visible = false
+end)
 
---────────────────────────────────────────────────────────────────────────────
+--─────────────────────────────────────────────────────────────────────────────
 -- BOOT
 --─────────────────────────────────────────────────────────────────────────────
 loadFeed()
@@ -2000,14 +2073,16 @@ pcall(renderFinder)
 if PLACE_ID ~= 107778070777162 then
     notify("Bukan place SAE — fitur egg bisa kosong", 5)
 else
-    notify("v7 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
+    notify("SAE Finder v8 siap — FINDER = feed, AUTO = hop.", 4)
 end
 
-_G.SAE_EGGF = {
+_G.SAE_FINDER = {
     unload  = unload,
     config  = CONFIG,
+    filter  = FILTER,
     state   = state,
-    version = "7.0",
+    feed    = feed,
+    version = "8.0",
     dump    = function()
         local out = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
@@ -2023,7 +2098,7 @@ _G.SAE_EGGF = {
             end
         end
         local txt = table.concat(out, "\n")
-        print("=== SAE DUMP v5 (" .. #out .. " kandidat) ===\n" .. txt)
+        print("=== SAE DUMP v8 (" .. #out .. " kandidat) ===\n" .. txt)
         pcall(function() setclipboard(txt) end)
         notify(#out .. " kandidat di-dump ke console & clipboard", 5)
     end,
@@ -2041,14 +2116,12 @@ task.spawn(function()
     pcall(fetchServers, false)
     if state.alive then renderServers() end
 end)
--- refresh jumlah pemain tiap 30s (x/7 feed tetap segar)
 task.spawn(function()
     while state.alive do
         task.wait(30)
         pcall(fetchServers, false)
     end
 end)
--- auto-diagnosa: kalau 6 detik masih 0 egg, buang sampel struktur ke console
 task.spawn(function()
     task.wait(6)
     if not state.alive then return end
@@ -2063,7 +2136,7 @@ task.spawn(function()
                 end
             end
         end)
-        print("[SAE] 0 egg terdeteksi — mode:" .. tostring(state.scanMode) ..
+        print("[SAE v8] 0 egg terdeteksi — mode:" .. tostring(state.scanMode) ..
             " | sampel objek:\n" .. table.concat(out, "\n"))
         notify("0 egg — buka console (F9), kirim isi ke Asta", 7)
     end
