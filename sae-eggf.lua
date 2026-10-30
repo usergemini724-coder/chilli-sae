@@ -1,10 +1,19 @@
 --[[═══════════════════════════════════════════════════════════════════════════
-    SAE — EGG FINDER + SERVER BROWSER  ·  v6
+    SAE — EGG FINDER + SERVER BROWSER  ·  v7
     Game   : Steal An Egg (place 107778070777162)
     Build  : keyless, no password, no HWID, no remote loader
-    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=6"))()
+    Load   : loadstring(game:HttpGet(".../sae-eggf.lua?v=7"))()
     Tabs   : [FINDER] [ESP] [SERVERS]
     Keys   : RIGHT-SHIFT = toggle UI      END = unload
+
+    v7 changes (ACCURACY FIX)
+      · label di-scope per kedalaman folder: value/rarity/mutasi hanya dibaca
+        dari cakupan setempat nama pet ditemukan → label telur tetangga di
+        folder induk tidak lagi tercatat sebagai nilai telur ini
+      · sanity clamp: value live > 12x base DB = label asing → dibuang,
+        fallback ke estimasi DB (biang "MIN 100B tapi isi <2B")
+      · parseMoney: dukung angka ber-koma & suffix huruf kecil
+      · chip MIN tampil "$100B" tanpa "/s" biar ringkas
 
     v6 changes
       · UI FINDER diganti total: feed FLAT Chilli-style (1 baris = 1 egg)
@@ -358,11 +367,12 @@ end
 -- supaya "Cosmic Skeleton Boss" tidak salah terbaca mutasi Fractured.
 --─────────────────────────────────────────────────────────────────────────────
 local function parseMoney(text)
-    local num, suf = string.match(text, "%$([%d%.]+)%s*(%a?)%s*/s")
+    local num, suf = string.match(text, "%$([%d%,%.]+)%s*(%a?)%s*/s")
     if num then
+        num = string.gsub(num, ",", "")
         local n = tonumber(num) or 0
         local suffixMult = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
-        n = n * (suffixMult[suf] or 1)
+        n = n * (suffixMult[suf] or suffixMult[string.upper(suf or "")] or 1)
         if n > 0 then return n end
     end
     return nil
@@ -382,18 +392,25 @@ local function blankOut(s, pattern)
 end
 
 local function extractInfo(inst, part, fallbackLabel)
-    local texts = {}
-    if fallbackLabel then table.insert(texts, fallbackLabel) end
+    -- v7 ACCURACY: teks dikumpulkan PER LEVEL kedalaman.
+    --   lvl 0 = di dalam model telur sendiri (billboard/label miliknya)
+    --   lvl 1..3 = naik ke folder induk → RAWAN campur label telur tetangga
+    -- Urutan insert = level terdalam dulu, jadi scan berurutan = paling dipercaya.
+    -- Semua sinyal (value/mult/rarity/mutasi) hanya dibaca dari cakupan
+    -- setinggi tempat nama pet ditemukan → label telur sebelah tidak lagi
+    -- dicatat sebagai nilai telur ini (biang "MIN 100B tapi isi 2B").
+    local texts = {}   -- { t = teks, lvl = level kedalaman }
+    if fallbackLabel then table.insert(texts, { t = fallbackLabel, lvl = 0 }) end
     pcall(function()
         local node = part
-        for _ = 1, 3 do
+        for lvl = 0, 3 do
             if not node then break end
             for _, ch in ipairs(node:GetDescendants()) do
                 if (ch:IsA("TextLabel") or ch:IsA("TextButton")) and ch.Text and #ch.Text > 0 and #ch.Text < 64 then
-                    table.insert(texts, ch.Text)
+                    table.insert(texts, { t = ch.Text, lvl = lvl })
                 end
             end
-            if #texts > 10 then break end
+            if #texts > 12 then break end
             node = node.Parent
         end
     end)
@@ -402,14 +419,11 @@ local function extractInfo(inst, part, fallbackLabel)
     local muts = {}
     local rarityTxt
     local dbBase, dbRar
+    local nameLvl = 3  -- tanpa nama = pakai cakupan penuh (perilaku lama)
 
-    -- gabung teks untuk pencarian nama & mutasi
-    local low = lower(table.concat(texts, " | "))
-
-    -- 1) nama pet via DB: kandidat penuh dulu ("cosmic skeleton boss" aman),
-    --    lalu varian tanpa kata mutasi ("golden kitsune" → "kitsune")
-    for _, t in ipairs(texts) do
-        local cand0 = lower(t)
+    -- 1) nama pet via DB (level terdalam dulu): kandidat penuh → varian tanpa mutasi
+    for _, it in ipairs(texts) do
+        local cand0 = lower(it.t)
         cand0 = string.gsub(cand0, "%s*egg%s*$", "")
         cand0 = string.gsub(cand0, "^big%s+", "")
         local hitName
@@ -427,12 +441,19 @@ local function extractInfo(inst, part, fallbackLabel)
         if hitName then
             dbBase, dbRar = PET_DB[hitName][1], PET_DB[hitName][2]
             nameTxt = hitName
-            low = blankOut(low, lower(t))
+            nameLvl = it.lvl
             break
         end
     end
 
-    -- 2) rarity via teks
+    -- 2) gabung teks HANYA dari cakupan lvl <= nameLvl
+    local scoped = {}
+    for _, it in ipairs(texts) do
+        if it.lvl <= nameLvl then table.insert(scoped, it.t) end
+    end
+    local low = lower(table.concat(scoped, " | "))
+
+    -- 3) rarity via teks (cakupan aman)
     for _, r in ipairs(RARITY_ORDER) do
         if string.find(low, r, 1, true) then
             rarityTxt = r
@@ -440,7 +461,7 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end
 
-    -- 3) mutasi: token terpanjang dulu, habis match dibuang dari teks
+    -- 4) mutasi: token terpanjang dulu, habis match dibuang dari teks
     for _, tk in ipairs(MUT_TOKENS) do
         local found
         low, found = blankOut(low, tk.tok)
@@ -451,18 +472,25 @@ local function extractInfo(inst, part, fallbackLabel)
         end
     end
 
-    -- 4) value & multiplier per teks
-    for _, t in ipairs(texts) do
+    -- 5) value & multiplier (cakupan aman, teks pertama yang cocok)
+    for _, t in ipairs(scoped) do
         local v = parseMoney(t)
         if v and not value then value = v end
         local m = parseMult(t)
         if m and not mult then mult = m end
     end
 
-    -- 5) nama tampilan terbaik (teks tanpa $ / xN yang paling panjang)
+    -- 6) SANITY CLAMP: value live yang keterlaluan dibanding base DB-nya
+    --    (= hampir pasti label telur tetangga) dibuang → pakai estimasi DB.
+    --    Batas 12x: stack mutasi penuh pun maks +-9x (aditif).
+    if value and dbBase and dbBase > 0 and value > dbBase * 12 then
+        value = nil
+    end
+
+    -- 7) nama tampilan terbaik (teks tanpa $ / xN terpanjang, cakupan aman)
     if not nameTxt then
         local score = -1
-        for _, t in ipairs(texts) do
+        for _, t in ipairs(scoped) do
             if not string.find(t, "%$") and not string.find(t, "x%s*[%d%.]") then
                 local letters = 0
                 for i = 1, #t do
@@ -482,9 +510,6 @@ local function extractInfo(inst, part, fallbackLabel)
     return nameTxt, value, mult, muts, rarityTxt, dbBase, dbRar
 end
 
---─────────────────────────────────────────────────────────────────────────────
--- ESP
---─────────────────────────────────────────────────────────────────────────────
 local function destroyESP(inst)
     local c = state.espCache[inst]
     if not c then return end
@@ -966,7 +991,7 @@ titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
 titleLabel.TextColor3 = C_TEXT
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Text = "SAE · EGG FINDER v6"
+titleLabel.Text = "SAE · EGG FINDER v7"
 titleLabel.Parent = titleBar
 
 local closeBtn = Instance.new("TextButton")
@@ -1372,7 +1397,8 @@ end
 local function syncButtons()
     btnAuto.Text = FILTER.auto and ("AUTO " .. FILTER.interval .. "s") or "AUTO OFF"
     btnAuto.TextColor3 = FILTER.auto and C_ACCENT or C_DIM
-    btnMinVal.Text = "MIN " .. (FILTER.minValue > 0 and fmtValue(FILTER.minValue) or "Any")
+    btnMinVal.Text = "MIN " .. (FILTER.minValue > 0 and
+        string.gsub(fmtValue(FILTER.minValue), "/s$", "") or "Any")
     btnRarity.Text = "RARITY " .. (FILTER.rarity == "any" and "Any" or FILTER.rarity)
     btnMut.Text = "MUT " .. (FILTER.mut == "any" and "Any" or FILTER.mut)
     btnPlyr.Text = "P<=" .. FILTER.maxPlayers
@@ -1778,7 +1804,7 @@ footer.Font = Enum.Font.Gotham
 footer.TextSize = 10
 footer.TextColor3 = C_DIM
 footer.TextXAlignment = Enum.TextXAlignment.Left
-footer.Text = "RSHIFT = sembunyikan · END = unload · v6"
+footer.Text = "RSHIFT = sembunyikan · END = unload · v7"
 footer.Parent = main
 
 --─────────────────────────────────────────────────────────────────────────────
@@ -1974,14 +2000,14 @@ pcall(renderFinder)
 if PLACE_ID ~= 107778070777162 then
     notify("Bukan place SAE — fitur egg bisa kosong", 5)
 else
-    notify("v6 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
+    notify("v7 loaded. FINDER = feed per-server + 2 filter. AUTO = hop.", 4)
 end
 
 _G.SAE_EGGF = {
     unload  = unload,
     config  = CONFIG,
     state   = state,
-    version = "6.0",
+    version = "7.0",
     dump    = function()
         local out = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
