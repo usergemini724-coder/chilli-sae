@@ -5,16 +5,17 @@ Rebuild **egg finder** untuk game **Steal An Egg** (place `107778070777162`) —
 ## Load
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=5"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/usergemini724-coder/chilli-sae/main/sae-eggf.lua?v=6"))()
 ```
 
 Ganti `v=1` → `v=2`, `v=3`, dst tiap habis edit (raw GitHub di-cache CDN ~5 menit).
 
-## Fitur v5
+## Fitur v6
 
-**Tab FINDER — feed per-server**
-- Baris per **server**: badge `★TOP` / id, jumlah pemain live `x/7`, total value, umur, tombol `JOIN`
-- Baris egg per server: nama, badge **RARITY** (10 tier ladder resmi: Common → Uncommon → Rare → Epic → Legendary → **Cosmic** → Mythic → Secret → Eternal → Divine), badge **MUTATION** (Silver/Golden/Rainbow/Bloom/Spirit Bloom/Parasite/Fractured), `$value/s` + `xmult` — value estimasi tampil `~$X/s`
+**Tab FINDER — feed FLAT Chilli-style (1 baris = 1 egg)**
+- Baris = satu egg: **ikon pengganti gambar** (kotak warna rarity + inisial pet; emas `★` = member TOP-10), nama pet, **badge mutasi** (Silver/Golden/Rainbow/Bloom/Spirit Bloom/Parasite/Fractured), `$value/s` hijau (`~` = estimasi DB), `xmult`, umur, **pemain live `x/7`** (hijau ≤4, oranye 5–6 = RACE), tombol `JOIN`
+- Sort: member **TOP-10** dulu (baris emas) → value desc → terbaru; maks 30 baris
+- JOIN per baris memakai server milik egg itu (pre-check live tetap jalan)
 - **2 filter terpisah**: `MUT` (7 mutasi, nama internal Sakura/GreatBloom/Monstrous/Boss ikut dikenali) dan `RARITY` (ladder penuh)
 - `MIN` — nilai minimum (Any/1M/100M/1B/10B/100B/1T per detik); `P<=` — batas pemain per server (default 4); `CLEAR`
 - **★TOP-10 dinamis**: 10 value terbesar lintas feed (base × mutasi); server yang memuatnya boleh **≤6/7** pemain (badge `1 SLOT RACE` saat 6/7) — server biasa ≤`P<=`/7, **7/7 selalu dibuang**
